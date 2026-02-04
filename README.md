@@ -25,7 +25,10 @@ A Rust implementation of [DiskANN](https://proceedings.neurips.cc/paper_files/pa
 | **Filtered Search** | Query with metadata predicates (e.g., category filters) |
 | **SIMD Acceleration** | Optimized distance calculations (AVX2, SSE4.1, NEON) |
 | **Product Quantization** | Compress vectors up to 64x with PQ encoding |
+| **Scalar Quantization** | F16 (2x) and Int8 (4x) compression with SIMD-accelerated distance |
 | **Memory-Mapped I/O** | Single-file storage with minimal RAM footprint |
+| **Byte Serialization** | Load indexes from bytes (network, embedded, no filesystem) |
+| **Benchmark Formats** | Read/write fvecs, ivecs, bvecs (standard ANN benchmark formats) |
 | **Parallel Processing** | Concurrent index building and batch queries |
 
 ## Quick Start
@@ -128,6 +131,68 @@ use diskann_rs::simd::{l2_squared, dot_product, cosine_distance};
 let dist = l2_squared(&vec_a, &vec_b);
 ```
 
+### Scalar Quantization (F16 / Int8)
+
+```rust
+use diskann_rs::{F16Quantizer, Int8Quantizer, VectorQuantizer};
+
+// F16: 2x compression, nearly lossless
+let f16q = F16Quantizer::new(128);
+let codes = f16q.encode(&vector);           // 128 dims -> 256 bytes
+let decoded = f16q.decode(&codes);          // Back to f32
+let dist = f16q.asymmetric_distance(&query, &codes);  // SIMD-accelerated
+
+// Int8: 4x compression, trained per-dimension scaling
+let int8q = Int8Quantizer::train(&training_vectors)?;
+let codes = int8q.encode(&vector);          // 128 dims -> 128 bytes
+let dist = int8q.asymmetric_distance(&query, &codes);
+
+// All quantizers implement VectorQuantizer trait
+fn search_with_quantizer(q: &dyn VectorQuantizer, query: &[f32], codes: &[u8]) -> f32 {
+    q.asymmetric_distance(query, codes)
+}
+```
+
+### Byte Loading (No Filesystem Required)
+
+```rust
+use anndists::dist::DistL2;
+use diskann_rs::DiskANN;
+use std::sync::Arc;
+
+// Build and serialize to bytes
+let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2{}, "index.db")?;
+let bytes: Vec<u8> = index.to_bytes();
+
+// Load from owned bytes (e.g., downloaded from network)
+let index = DiskANN::<DistL2>::from_bytes(bytes, DistL2{})?;
+
+// Load from shared bytes (multi-reader, zero-copy)
+let shared: Arc<[u8]> = load_from_somewhere().into();
+let index = DiskANN::<DistL2>::from_shared_bytes(shared, DistL2{})?;
+
+// Works for all index types
+let filtered_bytes = filtered_index.to_bytes();
+let incremental_bytes = incremental_index.to_bytes();
+```
+
+### Benchmark Format Support (fvecs/ivecs/bvecs)
+
+```rust
+use diskann_rs::formats::{read_fvecs, write_fvecs, read_ivecs, read_bvecs_as_f32};
+
+// Load standard ANN benchmark datasets (SIFT, GIST, GloVe, etc.)
+let base_vectors = read_fvecs("sift_base.fvecs")?;      // Vec<Vec<f32>>
+let ground_truth = read_ivecs("sift_groundtruth.ivecs")?; // Vec<Vec<i32>>
+let queries = read_fvecs("sift_query.fvecs")?;
+
+// Load byte vectors as normalized floats
+let mnist = read_bvecs_as_f32("mnist.bvecs")?;  // u8 [0,255] -> f32 [0,1]
+
+// Save your own vectors
+write_fvecs("my_vectors.fvecs", &vectors)?;
+```
+
 ## Performance
 
 ### Why diskann-rs? Memory-Mapped I/O
@@ -181,15 +246,63 @@ Benchmarks on Apple M4 Max:
 ### Memory Efficiency
 
 - ~330MB RAM for 2GB index (16% of file size)
-- Product Quantization: 64x compression (512 bytes → 8 bytes per vector)
+- **Product Quantization**: 64x compression (512 bytes → 8 bytes per vector)
+- **Int8 Quantization**: 4x compression (512 bytes → 128 bytes per vector)
+- **F16 Quantization**: 2x compression (512 bytes → 256 bytes per vector)
+
+### Quantization Trade-offs
+
+<p align="center">
+  <img src="docs/charts/quantization_comparison.svg" alt="Quantization Comparison" width="600">
+</p>
+
+| Method | Compression | Recall@10 | Use Case |
+|--------|-------------|-----------|----------|
+| None (f32) | 1x | 100% | Maximum accuracy |
+| F16 | 2x | 100% | General purpose, nearly lossless |
+| Int8 | 4x | 99% | Memory-constrained, high accuracy |
+| PQ-32 | 16x | ~62% | Large-scale, re-ranking |
+| PQ-8 | 64x | ~12% | Massive scale, coarse filtering |
 
 ## Architecture
+
+### Storage Abstraction
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                        Storage                                │
+├──────────────────────────────────────────────────────────────┤
+│  Mmap(Mmap)        - Memory-mapped file (default, lazy I/O)  │
+│  Owned(Vec<u8>)    - Owned bytes (network, embedded)         │
+│  Shared(Arc<[u8]>) - Reference-counted (multi-reader)        │
+└──────────────────────────────────────────────────────────────┘
+
+All variants deref to &[u8], so search logic is unified.
+```
 
 ### File Layout
 
 ```
 [ metadata_len:u64 ][ metadata (bincode) ][ padding to 1 MiB ]
 [ vectors (n × dim × f32) ][ adjacency (n × max_degree × u32) ]
+```
+
+### Quantization (Composable)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   VectorQuantizer trait                      │
+├─────────────────────────────────────────────────────────────┤
+│  encode(&[f32]) -> Vec<u8>     - Compress vector            │
+│  decode(&[u8]) -> Vec<f32>     - Decompress vector          │
+│  asymmetric_distance(q, c)     - Query vs compressed        │
+│  compression_ratio(dim)        - Bytes saved                │
+├─────────────────────────────────────────────────────────────┤
+│  Implementations:                                            │
+│    F16Quantizer      - 2x compression, ~lossless            │
+│    Int8Quantizer     - 4x compression, trained scaling      │
+│    ProductQuantizer  - 64x compression, codebook-based      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### Incremental Updates (Delta Layer)
@@ -249,7 +362,10 @@ DISKANN_BENCH_LARGE=1 cargo bench --bench benchmark
 |---------|------------|--------------|
 | Incremental updates | Yes | No |
 | Filtered search | Yes | No |
-| Product Quantization | Yes | No |
+| Product Quantization | Yes (64x) | No |
+| Scalar Quantization | Yes (F16 2x, Int8 4x) | No |
+| Byte loading (no files) | Yes | No |
+| Benchmark formats | Yes (fvecs/ivecs/bvecs) | No |
 | SIMD acceleration | Yes | Uses anndists |
 | Memory-mapped I/O | Yes | Yes |
 | Generic vector types | f32 | f32, u64, etc. |

@@ -63,6 +63,9 @@ mod incremental;
 mod filtered;
 pub mod simd;
 pub mod pq;
+pub mod storage;
+pub mod sq;
+pub mod formats;
 
 pub use incremental::{
     IncrementalDiskANN, IncrementalConfig, IncrementalStats,
@@ -75,9 +78,12 @@ pub use simd::{SimdL2, SimdDot, SimdCosine, simd_info};
 
 pub use pq::{ProductQuantizer, PQConfig, PQStats};
 
+pub use storage::Storage;
+
+pub use sq::{VectorQuantizer, F16Quantizer, Int8Quantizer};
+
 use anndists::prelude::Distance;
 use bytemuck;
-use memmap2::Mmap;
 use rand::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -85,6 +91,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Padding sentinel for adjacency slots (avoid colliding with node 0).
@@ -184,8 +191,8 @@ where
     pub(crate) vectors_offset: u64,
     pub(crate) adjacency_offset: u64,
 
-    /// Memory-mapped file
-    pub(crate) mmap: Mmap,
+    /// Backing storage (mmap, owned bytes, or shared bytes)
+    pub(crate) storage: Storage,
 
     /// The distance strategy
     pub(crate) dist: D,
@@ -358,7 +365,7 @@ where
             medoid_id: metadata.medoid_id,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
-            mmap,
+            storage: Storage::Mmap(mmap),
             dist,
         })
     }
@@ -397,9 +404,77 @@ where
             medoid_id: metadata.medoid_id,
             vectors_offset: metadata.vectors_offset,
             adjacency_offset: metadata.adjacency_offset,
-            mmap,
+            storage: Storage::Mmap(mmap),
             dist,
         })
+    }
+
+    /// Load an index from an owned byte buffer (no file needed).
+    pub fn from_bytes(bytes: Vec<u8>, dist: D) -> Result<Self, DiskAnnError> {
+        let metadata = Self::parse_metadata(&bytes)?;
+
+        let expected = std::any::type_name::<D>();
+        if metadata.distance_name != expected {
+            eprintln!(
+                "Warning: index recorded distance `{}` but you opened with `{}`",
+                metadata.distance_name, expected
+            );
+        }
+
+        Ok(Self {
+            dim: metadata.dim,
+            num_vectors: metadata.num_vectors,
+            max_degree: metadata.max_degree,
+            distance_name: metadata.distance_name,
+            medoid_id: metadata.medoid_id,
+            vectors_offset: metadata.vectors_offset,
+            adjacency_offset: metadata.adjacency_offset,
+            storage: Storage::Owned(bytes),
+            dist,
+        })
+    }
+
+    /// Load an index from a shared byte buffer (cheap clone, multi-reader).
+    pub fn from_shared_bytes(bytes: Arc<[u8]>, dist: D) -> Result<Self, DiskAnnError> {
+        let metadata = Self::parse_metadata(&bytes)?;
+
+        let expected = std::any::type_name::<D>();
+        if metadata.distance_name != expected {
+            eprintln!(
+                "Warning: index recorded distance `{}` but you opened with `{}`",
+                metadata.distance_name, expected
+            );
+        }
+
+        Ok(Self {
+            dim: metadata.dim,
+            num_vectors: metadata.num_vectors,
+            max_degree: metadata.max_degree,
+            distance_name: metadata.distance_name,
+            medoid_id: metadata.medoid_id,
+            vectors_offset: metadata.vectors_offset,
+            adjacency_offset: metadata.adjacency_offset,
+            storage: Storage::Shared(bytes),
+            dist,
+        })
+    }
+
+    /// Serialize the index to a byte vector.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.storage.to_vec()
+    }
+
+    /// Parse metadata from raw bytes (shared helper for from_bytes / from_shared_bytes).
+    fn parse_metadata(bytes: &[u8]) -> Result<Metadata, DiskAnnError> {
+        if bytes.len() < 8 {
+            return Err(DiskAnnError::IndexError("Buffer too small for metadata length".into()));
+        }
+        let md_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+        if bytes.len() < 8 + md_len {
+            return Err(DiskAnnError::IndexError("Buffer too small for metadata".into()));
+        }
+        let metadata: Metadata = bincode::deserialize(&bytes[8..8 + md_len])?;
+        Ok(metadata)
     }
 
     /// Searches the index for nearest neighbors using a best-first beam search.
@@ -503,7 +578,7 @@ where
         let offset = self.adjacency_offset + (node_id as u64 * self.max_degree as u64 * 4);
         let start = offset as usize;
         let end = start + (self.max_degree * 4);
-        let bytes = &self.mmap[start..end];
+        let bytes = &self.storage[start..end];
         bytemuck::cast_slice(bytes)
     }
 
@@ -512,7 +587,7 @@ where
         let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
         let start = offset as usize;
         let end = start + (self.dim * 4);
-        let bytes = &self.mmap[start..end];
+        let bytes = &self.storage[start..end];
         let vector: &[f32] = bytemuck::cast_slice(bytes);
         self.dist.eval(query, vector)
     }
@@ -522,7 +597,7 @@ where
         let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
         let start = offset as usize;
         let end = start + (self.dim * 4);
-        let bytes = &self.mmap[start..end];
+        let bytes = &self.storage[start..end];
         let vector: &[f32] = bytemuck::cast_slice(bytes);
         vector.to_vec()
     }
@@ -1017,6 +1092,61 @@ mod tests {
         let mut sorted = dists.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(dists, sorted);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_to_bytes_from_bytes_round_trip() {
+        let path = "test_bytes_rt.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+            vec![0.5, 0.5],
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, path).unwrap();
+        let bytes = index.to_bytes();
+
+        let index2 = DiskANN::<DistL2>::from_bytes(bytes, DistL2 {}).unwrap();
+        assert_eq!(index2.num_vectors, 5);
+        assert_eq!(index2.dim, 2);
+
+        let q = vec![0.9, 0.9];
+        let res1 = index.search(&q, 3, 8);
+        let res2 = index2.search(&q, 3, 8);
+        assert_eq!(res1, res2);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_from_shared_bytes() {
+        let path = "test_shared_bytes.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+        ];
+
+        let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, path).unwrap();
+        let bytes = index.to_bytes();
+        let shared: std::sync::Arc<[u8]> = bytes.into();
+
+        let index2 = DiskANN::<DistL2>::from_shared_bytes(shared, DistL2 {}).unwrap();
+        assert_eq!(index2.num_vectors, 4);
+        assert_eq!(index2.dim, 2);
+
+        let q = vec![0.9, 0.9];
+        let res = index2.search(&q, 2, 8);
+        assert_eq!(res[0], 3); // [1,1]
 
         let _ = fs::remove_file(path);
     }

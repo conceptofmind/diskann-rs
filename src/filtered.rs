@@ -50,6 +50,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::cmp::{Ordering, Reverse};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::sync::Arc;
 
 /// A single filter condition
 #[derive(Clone, Debug)]
@@ -266,6 +267,127 @@ where
             num_fields,
             labels_path,
         })
+    }
+
+    /// Serialize the filtered index to bytes.
+    ///
+    /// Format: `[index_len:u64][index_bytes][labels_bytes]`
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let index_bytes = self.index.to_bytes();
+        let labels_bytes = Self::serialize_labels(&self.labels, self.num_fields);
+        let mut out = Vec::with_capacity(8 + index_bytes.len() + labels_bytes.len());
+        out.extend_from_slice(&(index_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&index_bytes);
+        out.extend_from_slice(&labels_bytes);
+        out
+    }
+
+    /// Load a filtered index from bytes.
+    pub fn from_bytes(bytes: Vec<u8>, dist: D) -> Result<Self, DiskAnnError> {
+        if bytes.len() < 8 {
+            return Err(DiskAnnError::IndexError("Buffer too small".into()));
+        }
+        let index_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+        if bytes.len() < 8 + index_len {
+            return Err(DiskAnnError::IndexError("Buffer too small for index data".into()));
+        }
+        let index_bytes = bytes[8..8 + index_len].to_vec();
+        let labels_bytes = &bytes[8 + index_len..];
+
+        let index = DiskANN::<D>::from_bytes(index_bytes, dist)?;
+        let (labels, num_fields) = Self::deserialize_labels(labels_bytes)?;
+
+        if labels.len() != index.num_vectors {
+            return Err(DiskAnnError::IndexError(format!(
+                "Labels count ({}) != index vectors ({})",
+                labels.len(),
+                index.num_vectors
+            )));
+        }
+
+        Ok(Self {
+            index,
+            labels,
+            num_fields,
+            labels_path: String::new(),
+        })
+    }
+
+    /// Load a filtered index from shared bytes.
+    pub fn from_shared_bytes(bytes: Arc<[u8]>, dist: D) -> Result<Self, DiskAnnError> {
+        // We need to split the buffer, so we parse the header and use owned for both parts
+        if bytes.len() < 8 {
+            return Err(DiskAnnError::IndexError("Buffer too small".into()));
+        }
+        let index_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+        if bytes.len() < 8 + index_len {
+            return Err(DiskAnnError::IndexError("Buffer too small for index data".into()));
+        }
+        let index_bytes = bytes[8..8 + index_len].to_vec();
+        let labels_bytes = &bytes[8 + index_len..];
+
+        let index = DiskANN::<D>::from_bytes(index_bytes, dist)?;
+        let (labels, num_fields) = Self::deserialize_labels(labels_bytes)?;
+
+        if labels.len() != index.num_vectors {
+            return Err(DiskAnnError::IndexError(format!(
+                "Labels count ({}) != index vectors ({})",
+                labels.len(),
+                index.num_vectors
+            )));
+        }
+
+        Ok(Self {
+            index,
+            labels,
+            num_fields,
+            labels_path: String::new(),
+        })
+    }
+
+    fn serialize_labels(labels: &[Vec<u64>], num_fields: usize) -> Vec<u8> {
+        let meta = FilteredMetadata {
+            num_vectors: labels.len(),
+            num_fields,
+        };
+        let meta_bytes = bincode::serialize(&meta).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(meta_bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&meta_bytes);
+        for label_vec in labels {
+            for &val in label_vec {
+                out.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    fn deserialize_labels(bytes: &[u8]) -> Result<(Vec<Vec<u64>>, usize), DiskAnnError> {
+        if bytes.len() < 8 {
+            return Err(DiskAnnError::IndexError("Labels buffer too small".into()));
+        }
+        let meta_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+        if bytes.len() < 8 + meta_len {
+            return Err(DiskAnnError::IndexError("Labels buffer too small for metadata".into()));
+        }
+        let meta: FilteredMetadata = bincode::deserialize(&bytes[8..8 + meta_len])?;
+
+        let data = &bytes[8 + meta_len..];
+        let mut labels = Vec::with_capacity(meta.num_vectors);
+        let mut offset = 0;
+        for _ in 0..meta.num_vectors {
+            let mut label_vec = Vec::with_capacity(meta.num_fields);
+            for _ in 0..meta.num_fields {
+                if offset + 8 > data.len() {
+                    return Err(DiskAnnError::IndexError("Labels data truncated".into()));
+                }
+                label_vec.push(u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()));
+                offset += 8;
+            }
+            labels.push(label_vec);
+        }
+
+        Ok((labels, meta.num_fields))
     }
 
     fn save_labels(path: &str, labels: &[Vec<u64>], num_fields: usize) -> Result<(), DiskAnnError> {
@@ -506,7 +628,7 @@ where
             + (node_id as u64 * self.index.max_degree as u64 * 4);
         let start = offset as usize;
         let end = start + (self.index.max_degree * 4);
-        let bytes = &self.index.mmap[start..end];
+        let bytes = &self.index.storage[start..end];
         bytemuck::cast_slice(bytes)
     }
 
@@ -514,7 +636,7 @@ where
         let offset = self.index.vectors_offset + (idx as u64 * self.index.dim as u64 * 4);
         let start = offset as usize;
         let end = start + (self.index.dim * 4);
-        let bytes = &self.index.mmap[start..end];
+        let bytes = &self.index.storage[start..end];
         let vector: &[f32] = bytemuck::cast_slice(bytes);
         self.index.dist.eval(query, vector)
     }
@@ -667,6 +789,34 @@ mod tests {
         let results = index.search_filtered(&[25.0, 25.0], 5, 32, &filter);
         for id in &results {
             assert_eq!(index.get_labels(*id as usize).unwrap()[0], 1);
+        }
+
+        let _ = fs::remove_file(format!("{}.idx", base_path));
+        let _ = fs::remove_file(format!("{}.labels", base_path));
+    }
+
+    #[test]
+    fn test_filtered_to_bytes_from_bytes() {
+        let base_path = "test_filtered_bytes_rt";
+        let _ = fs::remove_file(format!("{}.idx", base_path));
+        let _ = fs::remove_file(format!("{}.labels", base_path));
+
+        let vectors: Vec<Vec<f32>> = (0..50)
+            .map(|i| vec![i as f32, i as f32])
+            .collect();
+        let labels: Vec<Vec<u64>> = (0..50).map(|i| vec![i % 3]).collect();
+
+        let index = FilteredDiskANN::<DistL2>::build(&vectors, &labels, base_path).unwrap();
+        let bytes = index.to_bytes();
+
+        let index2 = FilteredDiskANN::<DistL2>::from_bytes(bytes, DistL2 {}).unwrap();
+        assert_eq!(index2.num_vectors(), 50);
+        assert_eq!(index2.num_fields(), 1);
+
+        let filter = Filter::label_eq(0, 1);
+        let results = index2.search_filtered(&[25.0, 25.0], 5, 32, &filter);
+        for id in &results {
+            assert_eq!(index2.get_labels(*id as usize).unwrap()[0], 1);
         }
 
         let _ = fs::remove_file(format!("{}.idx", base_path));

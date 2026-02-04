@@ -347,6 +347,167 @@ mod neon_simd {
 }
 
 // =============================================================================
+// aarch64 NEON F16/Int8 helpers
+// =============================================================================
+
+#[cfg(target_arch = "aarch64")]
+mod neon_quant {
+    use std::arch::aarch64::*;
+
+    /// Convert f16 (as u16 bits) to f32.
+    /// Uses scalar half crate conversion (NEON f16 intrinsics are unstable in Rust).
+    /// Then uses NEON for the L2 distance computation.
+    #[inline]
+    pub fn f16_to_f32_bulk_neon(input: &[u16], output: &mut [f32]) {
+        debug_assert_eq!(input.len(), output.len());
+        for (i, &bits) in input.iter().enumerate() {
+            output[i] = half::f16::from_bits(bits).to_f32();
+        }
+    }
+
+    /// L2 squared: f16 database vector vs f32 query.
+    /// Converts f16->f32 in a temp buffer then uses NEON L2.
+    #[inline]
+    pub fn l2_f16_vs_f32_neon(f16_data: &[u16], query: &[f32]) -> f32 {
+        debug_assert_eq!(f16_data.len(), query.len());
+        let n = f16_data.len();
+
+        // Convert f16 to f32 first
+        let mut db = vec![0.0f32; n];
+        for (i, &bits) in f16_data.iter().enumerate() {
+            db[i] = half::f16::from_bits(bits).to_f32();
+        }
+
+        // Now use NEON for the L2 computation
+        super::neon_simd::l2_squared_neon(&db, query)
+    }
+
+    /// L2 squared: u8 scaled database vector vs f32 query
+    /// Dequantizes on the fly: val = u8 * scale + offset (per dimension)
+    #[inline]
+    pub fn l2_u8_scaled_vs_f32_neon(
+        u8_data: &[u8],
+        query: &[f32],
+        scales: &[f32],
+        offsets: &[f32],
+    ) -> f32 {
+        debug_assert_eq!(u8_data.len(), query.len());
+        debug_assert_eq!(scales.len(), query.len());
+        debug_assert_eq!(offsets.len(), query.len());
+        let n = u8_data.len();
+        let mut i = 0;
+
+        unsafe {
+            let mut sum = vdupq_n_f32(0.0);
+
+            while i + 4 <= n {
+                // Load 4 u8 values and convert to f32
+                let b0 = u8_data[i] as f32;
+                let b1 = u8_data[i + 1] as f32;
+                let b2 = u8_data[i + 2] as f32;
+                let b3 = u8_data[i + 3] as f32;
+                let vals = [b0, b1, b2, b3];
+                let vu8 = vld1q_f32(vals.as_ptr());
+
+                let vscale = vld1q_f32(scales.as_ptr().add(i));
+                let voff = vld1q_f32(offsets.as_ptr().add(i));
+                let vq = vld1q_f32(query.as_ptr().add(i));
+
+                // dequant = u8 * scale + offset
+                let dequant = vfmaq_f32(voff, vu8, vscale);
+                let diff = vsubq_f32(dequant, vq);
+                sum = vfmaq_f32(sum, diff, diff);
+                i += 4;
+            }
+
+            let mut result = vaddvq_f32(sum);
+
+            while i < n {
+                let dequant = u8_data[i] as f32 * scales[i] + offsets[i];
+                let d = dequant - query[i];
+                result += d * d;
+                i += 1;
+            }
+
+            result
+        }
+    }
+}
+
+// =============================================================================
+// x86_64 F16/Int8 SIMD helpers
+// =============================================================================
+
+#[cfg(target_arch = "x86_64")]
+mod x86_quant {
+    use std::arch::x86_64::*;
+
+    #[inline]
+    pub fn has_f16c() -> bool {
+        is_x86_feature_detected!("f16c")
+    }
+
+    /// Bulk convert f16 (as u16 bits) to f32 using F16C
+    #[target_feature(enable = "f16c")]
+    #[inline]
+    pub unsafe fn f16_to_f32_bulk_f16c(input: &[u16], output: &mut [f32]) {
+        debug_assert_eq!(input.len(), output.len());
+        let n = input.len();
+        let mut i = 0;
+
+        while i + 8 <= n {
+            let half8 = _mm_loadu_si128(input.as_ptr().add(i) as *const __m128i);
+            let f8 = _mm256_cvtph_ps(half8);
+            _mm256_storeu_ps(output.as_mut_ptr().add(i), f8);
+            i += 8;
+        }
+
+        while i < n {
+            output[i] = half::f16::from_bits(input[i]).to_f32();
+            i += 1;
+        }
+    }
+
+    /// L2 squared: f16 database vs f32 query, fused F16C convert+distance
+    #[target_feature(enable = "f16c", enable = "avx2")]
+    #[inline]
+    pub unsafe fn l2_f16_vs_f32_f16c(f16_data: &[u16], query: &[f32]) -> f32 {
+        debug_assert_eq!(f16_data.len(), query.len());
+        let n = f16_data.len();
+        let mut i = 0;
+        let mut sum = _mm256_setzero_ps();
+
+        while i + 8 <= n {
+            let half8 = _mm_loadu_si128(f16_data.as_ptr().add(i) as *const __m128i);
+            let db = _mm256_cvtph_ps(half8);
+            let q = _mm256_loadu_ps(query.as_ptr().add(i));
+            let diff = _mm256_sub_ps(db, q);
+            sum = _mm256_fmadd_ps(diff, diff, sum);
+            i += 8;
+        }
+
+        // Horizontal sum
+        let high = _mm256_extractf128_ps(sum, 1);
+        let low = _mm256_castps256_ps128(sum);
+        let sum128 = _mm_add_ps(high, low);
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let final_sum = _mm_add_ss(sums, shuf2);
+        let mut result = _mm_cvtss_f32(final_sum);
+
+        while i < n {
+            let f = half::f16::from_bits(f16_data[i]).to_f32();
+            let d = f - query[i];
+            result += d * d;
+            i += 1;
+        }
+
+        result
+    }
+}
+
+// =============================================================================
 // Unified dispatch functions
 // =============================================================================
 
@@ -427,6 +588,99 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 
     let cosine_sim = dot / (norm_a * norm_b);
     1.0 - cosine_sim.clamp(-1.0, 1.0)
+}
+
+// =============================================================================
+// F16 / Int8 quantization dispatch functions
+// =============================================================================
+
+/// Bulk convert f16 values (as u16 bits) to f32.
+/// Uses F16C on x86_64 or NEON vcvt on aarch64, scalar fallback otherwise.
+#[inline]
+pub fn f16_to_f32_bulk(input: &[u16], output: &mut [f32]) {
+    debug_assert_eq!(input.len(), output.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86_quant::has_f16c() {
+            unsafe { x86_quant::f16_to_f32_bulk_f16c(input, output) };
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon_quant::f16_to_f32_bulk_neon(input, output);
+        return;
+    }
+
+    // Scalar fallback
+    #[allow(unreachable_code)]
+    for (i, &bits) in input.iter().enumerate() {
+        output[i] = half::f16::from_bits(bits).to_f32();
+    }
+}
+
+/// L2 squared distance: f16 database vector (as u16 bits) vs f32 query.
+/// Fused convert + distance for fewer memory passes.
+#[inline]
+pub fn l2_f16_vs_f32(f16_data: &[u16], query: &[f32]) -> f32 {
+    debug_assert_eq!(f16_data.len(), query.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if x86_quant::has_f16c() && x86_simd::has_avx2() {
+            return unsafe { x86_quant::l2_f16_vs_f32_f16c(f16_data, query) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        return neon_quant::l2_f16_vs_f32_neon(f16_data, query);
+    }
+
+    // Scalar fallback
+    #[allow(unreachable_code)]
+    {
+        let mut sum = 0.0f32;
+        for (i, &bits) in f16_data.iter().enumerate() {
+            let f = half::f16::from_bits(bits).to_f32();
+            let d = f - query[i];
+            sum += d * d;
+        }
+        sum
+    }
+}
+
+/// L2 squared distance: u8 quantized vector vs f32 query.
+/// Dequantizes on the fly: `value = u8_val * scale[dim] + offset[dim]`
+#[inline]
+pub fn l2_u8_scaled_vs_f32(
+    u8_data: &[u8],
+    query: &[f32],
+    scales: &[f32],
+    offsets: &[f32],
+) -> f32 {
+    debug_assert_eq!(u8_data.len(), query.len());
+    debug_assert_eq!(scales.len(), query.len());
+    debug_assert_eq!(offsets.len(), query.len());
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        return neon_quant::l2_u8_scaled_vs_f32_neon(u8_data, query, scales, offsets);
+    }
+
+    // Scalar fallback (also used on x86_64 without specific intrinsic)
+    #[allow(unreachable_code)]
+    {
+        let mut sum = 0.0f32;
+        for i in 0..u8_data.len() {
+            let dequant = u8_data[i] as f32 * scales[i] + offsets[i];
+            let d = dequant - query[i];
+            sum += d * d;
+        }
+        sum
+    }
 }
 
 // =============================================================================

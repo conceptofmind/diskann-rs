@@ -669,6 +669,153 @@ where
         Ok(())
     }
 
+    /// Serialize the entire incremental index to bytes.
+    ///
+    /// Format:
+    /// ```text
+    /// [has_base:u8][base_len:u64][base_bytes...]
+    /// [dim:u64]
+    /// [num_delta:u64][delta_vectors flat: num_delta * dim * f32]
+    /// [num_delta_graph:u64][for each: [deg:u32][neighbors: deg * u32]]
+    /// [entry_point:i64] (-1 if None)
+    /// [max_degree:u64]
+    /// [num_tombstones:u64][tombstone_ids: num_tombstones * u64]
+    /// ```
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let delta = self.delta.read().unwrap();
+        let tombstones = self.tombstones.read().unwrap();
+
+        let mut out = Vec::new();
+
+        // Base index
+        if let Some(ref base) = self.base {
+            out.push(1u8);
+            let base_bytes = base.to_bytes();
+            out.extend_from_slice(&(base_bytes.len() as u64).to_le_bytes());
+            out.extend_from_slice(&base_bytes);
+        } else {
+            out.push(0u8);
+        }
+
+        // Dimension
+        out.extend_from_slice(&(self.dim as u64).to_le_bytes());
+
+        // Delta vectors
+        out.extend_from_slice(&(delta.vectors.len() as u64).to_le_bytes());
+        for v in &delta.vectors {
+            let bytes: &[u8] = bytemuck::cast_slice(v);
+            out.extend_from_slice(bytes);
+        }
+
+        // Delta graph
+        out.extend_from_slice(&(delta.graph.len() as u64).to_le_bytes());
+        for neighbors in &delta.graph {
+            out.extend_from_slice(&(neighbors.len() as u32).to_le_bytes());
+            let bytes: &[u8] = bytemuck::cast_slice(neighbors);
+            out.extend_from_slice(bytes);
+        }
+
+        // Entry point
+        let ep = delta.entry_point.map(|e| e as i64).unwrap_or(-1);
+        out.extend_from_slice(&ep.to_le_bytes());
+
+        // Max degree
+        out.extend_from_slice(&(delta.max_degree as u64).to_le_bytes());
+
+        // Tombstones
+        out.extend_from_slice(&(tombstones.len() as u64).to_le_bytes());
+        for &id in tombstones.iter() {
+            out.extend_from_slice(&id.to_le_bytes());
+        }
+
+        out
+    }
+
+    /// Load an incremental index from bytes.
+    pub fn from_bytes(bytes: &[u8], dist: D, config: IncrementalConfig) -> Result<Self, DiskAnnError> {
+        let mut pos = 0;
+
+        // Helper to read a slice
+        macro_rules! read_bytes {
+            ($n:expr) => {{
+                if pos + $n > bytes.len() {
+                    return Err(DiskAnnError::IndexError("Incremental buffer truncated".into()));
+                }
+                let slice = &bytes[pos..pos + $n];
+                pos += $n;
+                slice
+            }};
+        }
+
+        // Base index
+        let has_base = read_bytes!(1)[0];
+        let base = if has_base == 1 {
+            let base_len = u64::from_le_bytes(read_bytes!(8).try_into().unwrap()) as usize;
+            let base_data = read_bytes!(base_len).to_vec();
+            Some(DiskANN::<D>::from_bytes(base_data, dist)?)
+        } else {
+            None
+        };
+
+        // Dimension
+        let dim = u64::from_le_bytes(read_bytes!(8).try_into().unwrap()) as usize;
+
+        // Delta vectors
+        let num_delta = u64::from_le_bytes(read_bytes!(8).try_into().unwrap()) as usize;
+        let mut delta_vectors = Vec::with_capacity(num_delta);
+        for _ in 0..num_delta {
+            let vbytes = read_bytes!(dim * 4);
+            let floats: Vec<f32> = vbytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            delta_vectors.push(floats);
+        }
+
+        // Delta graph
+        let num_graph = u64::from_le_bytes(read_bytes!(8).try_into().unwrap()) as usize;
+        let mut delta_graph = Vec::with_capacity(num_graph);
+        for _ in 0..num_graph {
+            let deg = u32::from_le_bytes(read_bytes!(4).try_into().unwrap()) as usize;
+            let nbytes = read_bytes!(deg * 4);
+            let neighbors: Vec<u32> = nbytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            delta_graph.push(neighbors);
+        }
+
+        // Entry point
+        let ep = i64::from_le_bytes(read_bytes!(8).try_into().unwrap());
+        let entry_point = if ep >= 0 { Some(ep as u32) } else { None };
+
+        // Max degree
+        let max_degree = u64::from_le_bytes(read_bytes!(8).try_into().unwrap()) as usize;
+
+        // Tombstones
+        let num_tombstones = u64::from_le_bytes(read_bytes!(8).try_into().unwrap()) as usize;
+        let mut tombstones = HashSet::with_capacity(num_tombstones);
+        for _ in 0..num_tombstones {
+            let id = u64::from_le_bytes(read_bytes!(8).try_into().unwrap());
+            tombstones.insert(id);
+        }
+
+        Ok(Self {
+            base,
+            delta: RwLock::new(DeltaLayer {
+                vectors: delta_vectors,
+                graph: delta_graph,
+                entry_point,
+                max_degree,
+            }),
+            tombstones: RwLock::new(tombstones),
+            dist,
+            config,
+            base_path: None,
+            dim,
+        })
+    }
+
     /// Get statistics about the index
     pub fn stats(&self) -> IncrementalStats {
         let delta = self.delta.read().unwrap();
@@ -852,5 +999,43 @@ mod tests {
         let best_vec = index.get_vector(results[0].0).unwrap();
         let dist = euclid(&best_vec, &[0.5, 0.5]);
         assert!(dist < 0.01);
+    }
+
+    #[test]
+    fn test_incremental_to_bytes_from_bytes() {
+        let path = "test_incr_bytes_rt.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+        ];
+
+        let index = IncrementalDiskANN::<DistL2>::build_default(&vectors, path).unwrap();
+
+        // Add delta vectors
+        index.add_vectors(&[vec![0.5, 0.5], vec![2.0, 2.0]]).unwrap();
+
+        // Delete one
+        index.delete_vectors(&[0]).unwrap();
+
+        let bytes = index.to_bytes();
+
+        let index2 = IncrementalDiskANN::<DistL2>::from_bytes(
+            &bytes, DistL2 {}, IncrementalConfig::default()
+        ).unwrap();
+
+        let stats = index2.stats();
+        assert_eq!(stats.base_vectors, 4);
+        assert_eq!(stats.delta_vectors, 2);
+        assert_eq!(stats.tombstones, 1);
+
+        // Search should exclude tombstone and include delta
+        let results = index2.search(&[0.5, 0.5], 3, 8);
+        assert!(!results.contains(&0), "Deleted vector should not appear");
+
+        let _ = fs::remove_file(path);
     }
 }
