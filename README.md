@@ -235,7 +235,7 @@ Unlike in-memory indexes that require loading the entire graph into RAM, diskann
 
 ### Dataset Benchmarks
 
-Benchmarks on Apple M4 Max:
+Benchmarks on Apple M1 Max:
 
 | Dataset | Vectors | Build Time | QPS | Recall@10 |
 |---------|---------|------------|-----|-----------|
