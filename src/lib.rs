@@ -66,9 +66,13 @@ pub mod pq;
 pub mod storage;
 pub mod sq;
 pub mod formats;
+mod quantized;
+
+pub use quantized::{QuantizedDiskANN, QuantizedConfig};
 
 pub use incremental::{
     IncrementalDiskANN, IncrementalConfig, IncrementalStats,
+    IncrementalQuantizedConfig, QuantizerKind,
     is_delta_id, delta_local_idx,
 };
 
@@ -95,7 +99,12 @@ use std::sync::Arc;
 use thiserror::Error;
 
 /// Padding sentinel for adjacency slots (avoid colliding with node 0).
-const PAD_U32: u32 = u32::MAX;
+pub(crate) const PAD_U32: u32 = u32::MAX;
+
+/// Magic number for the core index format: "DANN"
+const CORE_MAGIC: u32 = 0x44414E4E;
+/// Current core index format version
+const CORE_FORMAT_VERSION: u32 = 1;
 
 /// Defaults for in-memory DiskANN builds
 pub const DISKANN_DEFAULT_MAX_DEGREE: usize = 64;
@@ -149,9 +158,9 @@ struct Metadata {
 
 /// Candidate for search/frontier queues
 #[derive(Clone, Copy)]
-struct Candidate {
-    dist: f32,
-    id: u32,
+pub(crate) struct Candidate {
+    pub dist: f32,
+    pub id: u32,
 }
 impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool {
@@ -168,6 +177,192 @@ impl PartialOrd for Candidate {
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
         self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
+
+/// Internal abstraction for a searchable graph index with u32 IDs.
+#[allow(dead_code)]
+pub(crate) trait GraphIndex: Send + Sync {
+    fn num_vectors(&self) -> usize;
+    fn dim(&self) -> usize;
+    fn entry_point(&self) -> u32;
+    fn distance_to(&self, query: &[f32], id: u32) -> f32;
+    fn get_neighbors(&self, id: u32) -> Vec<u32>; // PAD_U32 already filtered
+    fn get_vector(&self, id: u32) -> Vec<f32>;
+    fn is_live(&self, _id: u32) -> bool {
+        true
+    }
+}
+
+impl<D> GraphIndex for DiskANN<D>
+where
+    D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
+{
+    fn num_vectors(&self) -> usize {
+        self.num_vectors
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn entry_point(&self) -> u32 {
+        self.medoid_id
+    }
+    fn distance_to(&self, query: &[f32], id: u32) -> f32 {
+        DiskANN::distance_to(self, query, id as usize)
+    }
+    fn get_neighbors(&self, id: u32) -> Vec<u32> {
+        DiskANN::get_neighbors(self, id)
+            .iter()
+            .copied()
+            .filter(|&nb| nb != PAD_U32)
+            .collect()
+    }
+    fn get_vector(&self, id: u32) -> Vec<f32> {
+        DiskANN::get_vector(self, id as usize)
+    }
+}
+
+/// Configuration for the unified beam search.
+pub(crate) struct BeamSearchConfig {
+    /// If set, use an expanded working set of this size (for filtered search).
+    /// Candidates in the expanded set participate in graph exploration but
+    /// only candidates passing the filter are added to the results.
+    pub expanded_beam: Option<usize>,
+    /// Maximum iterations before forced termination (for filtered search).
+    pub max_iterations: Option<usize>,
+    /// Early termination factor: stop when best frontier > worst_result * factor
+    /// (for filtered search).
+    pub early_term_factor: Option<f32>,
+}
+
+impl Default for BeamSearchConfig {
+    fn default() -> Self {
+        Self {
+            expanded_beam: None,
+            max_iterations: None,
+            early_term_factor: None,
+        }
+    }
+}
+
+/// Unified beam search used by all search variants (base, quantized, filtered).
+///
+/// - `start_ids`: entry point nodes (typically medoid, or multiple seeds)
+/// - `beam_width`: working set size (number of closest candidates maintained)
+/// - `k`: number of results to return
+/// - `distance_fn`: computes distance from query to node id
+/// - `neighbors_fn`: returns neighbor ids for a node (filtered, no PAD_U32)
+/// - `filter_fn`: returns true if a candidate should be included in results
+/// - `config`: optional expanded beam / iteration limits for filtered search
+pub(crate) fn beam_search(
+    start_ids: &[u32],
+    beam_width: usize,
+    k: usize,
+    distance_fn: impl Fn(u32) -> f32,
+    neighbors_fn: impl Fn(u32) -> Vec<u32>,
+    filter_fn: impl Fn(u32) -> bool,
+    config: BeamSearchConfig,
+) -> Vec<(u32, f32)> {
+    let working_beam = config.expanded_beam.unwrap_or(beam_width);
+    let is_filtered = config.expanded_beam.is_some();
+
+    let mut visited = HashSet::new();
+    let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
+    let mut w: BinaryHeap<Candidate> = BinaryHeap::new(); // working set (max-heap by dist)
+
+    // For filtered search, maintain a separate sorted results vec
+    let mut results: Vec<(u32, f32)> = if is_filtered {
+        Vec::with_capacity(k)
+    } else {
+        Vec::new() // unused in non-filtered mode
+    };
+
+    // Seed from all start nodes
+    for &sid in start_ids {
+        if !visited.insert(sid) {
+            continue;
+        }
+        let d = distance_fn(sid);
+        let cand = Candidate { dist: d, id: sid };
+        frontier.push(Reverse(cand));
+        w.push(cand);
+        if is_filtered && filter_fn(sid) {
+            results.push((sid, d));
+        }
+    }
+
+    let mut iterations = 0;
+    let max_iterations = config.max_iterations.unwrap_or(usize::MAX);
+    let early_term_factor = config.early_term_factor.unwrap_or(f32::MAX);
+
+    while let Some(Reverse(best)) = frontier.peek().copied() {
+        iterations += 1;
+        if iterations > max_iterations {
+            break;
+        }
+
+        // Filtered early termination: stop when best frontier can't improve worst result
+        if is_filtered && results.len() >= k {
+            if let Some((_, worst_dist)) = results.last() {
+                if best.dist > *worst_dist * early_term_factor {
+                    break;
+                }
+            }
+        }
+
+        // Standard beam termination
+        if w.len() >= working_beam {
+            if let Some(worst) = w.peek() {
+                if best.dist >= worst.dist {
+                    break;
+                }
+            }
+        }
+
+        let Reverse(current) = frontier.pop().unwrap();
+
+        for nb in neighbors_fn(current.id) {
+            if !visited.insert(nb) {
+                continue;
+            }
+
+            let d = distance_fn(nb);
+            let cand = Candidate { dist: d, id: nb };
+
+            // Always add to working set for graph exploration
+            if w.len() < working_beam {
+                w.push(cand);
+                frontier.push(Reverse(cand));
+            } else if d < w.peek().unwrap().dist {
+                w.pop();
+                w.push(cand);
+                frontier.push(Reverse(cand));
+            }
+
+            // For filtered search, maintain separate results
+            if is_filtered && filter_fn(nb) {
+                let pos = results
+                    .iter()
+                    .position(|(_, dist)| d < *dist)
+                    .unwrap_or(results.len());
+                if pos < k {
+                    results.insert(pos, (nb, d));
+                    if results.len() > k {
+                        results.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    if is_filtered {
+        results
+    } else {
+        // Non-filtered: extract top-k from working set
+        let mut candidates: Vec<_> = w.into_vec();
+        candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        candidates.truncate(k);
+        candidates.into_iter().map(|c| (c.id, c.dist)).collect()
     }
 }
 
@@ -349,6 +544,8 @@ where
 
         let md_bytes = bincode::serialize(&metadata)?;
         file.seek(SeekFrom::Start(0))?;
+        file.write_all(&CORE_MAGIC.to_le_bytes())?;
+        file.write_all(&CORE_FORMAT_VERSION.to_le_bytes())?;
         let md_len = md_bytes.len() as u64;
         file.write_all(&md_len.to_le_bytes())?;
         file.write_all(&md_bytes)?;
@@ -374,11 +571,44 @@ where
     pub fn open_index_with(path: &str, dist: D) -> Result<Self, DiskAnnError> {
         let mut file = OpenOptions::new().read(true).write(false).open(path)?;
 
+        // Read first 4 bytes to detect format (magic or old-style md_len)
+        let mut buf4 = [0u8; 4];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut buf4)?;
+        let first_u32 = u32::from_le_bytes(buf4);
+
+        let md_offset = if first_u32 == CORE_MAGIC {
+            // New format: [magic:u32][version:u32][md_len:u64][metadata...]
+            let mut ver_buf = [0u8; 4];
+            file.read_exact(&mut ver_buf)?;
+            let version = u32::from_le_bytes(ver_buf);
+            if version != CORE_FORMAT_VERSION {
+                return Err(DiskAnnError::IndexError(format!(
+                    "Unsupported core format version: {}", version
+                )));
+            }
+            8u64 // magic + version = 8 bytes, then md_len starts
+        } else {
+            // Old format: [md_len:u64][metadata...]
+            file.seek(SeekFrom::Start(0))?;
+            0u64
+        };
+
         // Read metadata length
         let mut buf8 = [0u8; 8];
-        file.seek(SeekFrom::Start(0))?;
+        file.seek(SeekFrom::Start(md_offset))?;
         file.read_exact(&mut buf8)?;
         let md_len = u64::from_le_bytes(buf8);
+
+        // Sanity check: metadata length must be reasonable (< 1 MiB and < file size)
+        let file_size = file.seek(SeekFrom::End(0))?;
+        if md_len > 1024 * 1024 || md_offset + 8 + md_len > file_size {
+            return Err(DiskAnnError::IndexError(format!(
+                "Invalid metadata length {} (file size {})",
+                md_len, file_size
+            )));
+        }
+        file.seek(SeekFrom::Start(md_offset + 8))?;
 
         // Read metadata
         let mut md_bytes = vec![0u8; md_len as usize];
@@ -465,22 +695,43 @@ where
     }
 
     /// Parse metadata from raw bytes (shared helper for from_bytes / from_shared_bytes).
+    /// Handles both new format (with magic/version) and old format (raw md_len).
     fn parse_metadata(bytes: &[u8]) -> Result<Metadata, DiskAnnError> {
         if bytes.len() < 8 {
             return Err(DiskAnnError::IndexError("Buffer too small for metadata length".into()));
         }
-        let md_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
-        if bytes.len() < 8 + md_len {
+
+        // Detect format: check first 4 bytes for magic
+        let first_u32 = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let md_offset = if first_u32 == CORE_MAGIC {
+            // New format: skip magic(4) + version(4)
+            if bytes.len() < 16 {
+                return Err(DiskAnnError::IndexError("Buffer too small for header".into()));
+            }
+            let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            if version != CORE_FORMAT_VERSION {
+                return Err(DiskAnnError::IndexError(format!(
+                    "Unsupported core format version: {}", version
+                )));
+            }
+            8
+        } else {
+            0
+        };
+
+        if bytes.len() < md_offset + 8 {
+            return Err(DiskAnnError::IndexError("Buffer too small for metadata length".into()));
+        }
+        let md_len = u64::from_le_bytes(bytes[md_offset..md_offset + 8].try_into().unwrap()) as usize;
+        if bytes.len() < md_offset + 8 + md_len {
             return Err(DiskAnnError::IndexError("Buffer too small for metadata".into()));
         }
-        let metadata: Metadata = bincode::deserialize(&bytes[8..8 + md_len])?;
+        let metadata: Metadata = bincode::deserialize(&bytes[md_offset + 8..md_offset + 8 + md_len])?;
         Ok(metadata)
     }
 
     /// Searches the index for nearest neighbors using a best-first beam search.
-    /// Termination rule: continue while the best frontier can still improve the worst in working set.
     /// Like `search` but also returns the distance for each neighbor.
-    /// Distances are exactly the ones computed during the beam search.
     pub fn search_with_dists(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<(u32, f32)> {
         assert_eq!(
             query.len(),
@@ -490,80 +741,15 @@ where
             self.dim
         );
 
-        #[derive(Clone, Copy)]
-        struct Candidate {
-            dist: f32,
-            id: u32,
-        }
-        impl PartialEq for Candidate {
-            fn eq(&self, o: &Self) -> bool {
-                self.dist == o.dist && self.id == o.id
-            }
-        }
-        impl Eq for Candidate {}
-        impl PartialOrd for Candidate {
-            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-                self.dist.partial_cmp(&o.dist)
-            }
-        }
-        impl Ord for Candidate {
-            fn cmp(&self, o: &Self) -> Ordering {
-                self.partial_cmp(o).unwrap_or(Ordering::Equal)
-            }
-        }
-
-        let mut visited = HashSet::new();
-        let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new(); // best-first by dist
-        let mut w: BinaryHeap<Candidate> = BinaryHeap::new(); // working set, max-heap by dist
-
-        // seed from medoid
-        let start_dist = self.distance_to(query, self.medoid_id as usize);
-        let start = Candidate {
-            dist: start_dist,
-            id: self.medoid_id,
-        };
-        frontier.push(Reverse(start));
-        w.push(start);
-        visited.insert(self.medoid_id);
-
-        // expand while best frontier can still improve worst in working set
-        while let Some(Reverse(best)) = frontier.peek().copied() {
-            if w.len() >= beam_width {
-                if let Some(worst) = w.peek() {
-                    if best.dist >= worst.dist {
-                        break;
-                    }
-                }
-            }
-            let Reverse(current) = frontier.pop().unwrap();
-
-            for &nb in self.get_neighbors(current.id) {
-                if nb == PAD_U32 {
-                    continue;
-                }
-                if !visited.insert(nb) {
-                    continue;
-                }
-
-                let d = self.distance_to(query, nb as usize);
-                let cand = Candidate { dist: d, id: nb };
-
-                if w.len() < beam_width {
-                    w.push(cand);
-                    frontier.push(Reverse(cand));
-                } else if d < w.peek().unwrap().dist {
-                    w.pop();
-                    w.push(cand);
-                    frontier.push(Reverse(cand));
-                }
-            }
-        }
-
-        // top-k by distance, keep distances
-        let mut results: Vec<_> = w.into_vec();
-        results.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
-        results.truncate(k);
-        results.into_iter().map(|c| (c.id, c.dist)).collect()
+        beam_search(
+            &[self.medoid_id],
+            beam_width,
+            k,
+            |id| self.distance_to(query, id as usize),
+            |id| self.get_neighbors(id).iter().copied().filter(|&nb| nb != PAD_U32).collect(),
+            |_| true,
+            BeamSearchConfig::default(),
+        )
     }
     /// search but only return neighbor ids
     pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<u32> {
@@ -574,7 +760,7 @@ where
     }
 
     /// Gets the neighbors of a node from the (fixed-degree) adjacency region
-    fn get_neighbors(&self, node_id: u32) -> &[u32] {
+    pub(crate) fn get_neighbors(&self, node_id: u32) -> &[u32] {
         let offset = self.adjacency_offset + (node_id as u64 * self.max_degree as u64 * 4);
         let start = offset as usize;
         let end = start + (self.max_degree * 4);
@@ -583,7 +769,7 @@ where
     }
 
     /// Computes distance between `query` and vector `idx`
-    fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
+    pub(crate) fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
         let offset = self.vectors_offset + (idx as u64 * self.dim as u64 * 4);
         let start = offset as usize;
         let end = start + (self.dim * 4);
@@ -872,14 +1058,14 @@ fn prune_neighbors<D: Distance<f32> + Copy>(
 
     // fill with closest if still not full
     for &(cand_id, _) in &sorted {
+        if pruned.len() >= max_degree {
+            break;
+        }
         if cand_id as usize == node_id {
             continue;
         }
         if !pruned.contains(&cand_id) {
             pruned.push(cand_id);
-            if pruned.len() >= max_degree {
-                break;
-            }
         }
     }
 
@@ -1147,6 +1333,212 @@ mod tests {
         let q = vec![0.9, 0.9];
         let res = index2.search(&q, 2, 8);
         assert_eq!(res[0], 3); // [1,1]
+
+        let _ = fs::remove_file(path);
+    }
+
+    // ================================================================
+    // Unit tests for graph algorithms (no file I/O)
+    // ================================================================
+
+    #[test]
+    fn test_candidate_ordering() {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        let a = Candidate { dist: 1.0, id: 0 };
+        let b = Candidate { dist: 2.0, id: 1 };
+        let c = Candidate { dist: 0.5, id: 2 };
+
+        // Natural ordering: smaller dist is "less"
+        assert!(a < b);
+        assert!(c < a);
+
+        // Min-heap via Reverse
+        let mut min_heap: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
+        min_heap.push(Reverse(a));
+        min_heap.push(Reverse(b));
+        min_heap.push(Reverse(c));
+        assert_eq!(min_heap.pop().unwrap().0.id, 2); // dist 0.5
+        assert_eq!(min_heap.pop().unwrap().0.id, 0); // dist 1.0
+        assert_eq!(min_heap.pop().unwrap().0.id, 1); // dist 2.0
+
+        // Max-heap (natural order)
+        let mut max_heap: BinaryHeap<Candidate> = BinaryHeap::new();
+        max_heap.push(a);
+        max_heap.push(b);
+        max_heap.push(c);
+        assert_eq!(max_heap.peek().unwrap().id, 1); // dist 2.0 at top
+    }
+
+    #[test]
+    fn test_beam_search_small_graph() {
+        // Hand-crafted 5-node graph:
+        //   0 --1.0-- 1 --1.0-- 2
+        //   |                   |
+        //  2.0                 1.0
+        //   |                   |
+        //   3 ------1.5------- 4
+        //
+        // Node positions: 0=(0,0), 1=(1,0), 2=(2,0), 3=(0,2), 4=(2,1)
+        let positions: Vec<[f32; 2]> = vec![
+            [0.0, 0.0], // 0
+            [1.0, 0.0], // 1
+            [2.0, 0.0], // 2
+            [0.0, 2.0], // 3
+            [2.0, 1.0], // 4
+        ];
+
+        let neighbors: Vec<Vec<u32>> = vec![
+            vec![1, 3],    // 0 -> 1, 3
+            vec![0, 2],    // 1 -> 0, 2
+            vec![1, 4],    // 2 -> 1, 4
+            vec![0, 4],    // 3 -> 0, 4
+            vec![2, 3],    // 4 -> 2, 3
+        ];
+
+        // Query near node 4: (2.1, 0.9)
+        let query = [2.1f32, 0.9];
+
+        let results = beam_search(
+            &[0], // start from node 0
+            5,
+            3,
+            |id| {
+                let p = &positions[id as usize];
+                ((query[0] - p[0]).powi(2) + (query[1] - p[1]).powi(2)).sqrt()
+            },
+            |id| neighbors[id as usize].clone(),
+            |_| true,
+            BeamSearchConfig::default(),
+        );
+
+        assert_eq!(results.len(), 3);
+        // Node 4 (2,1) should be closest to query (2.1, 0.9)
+        assert_eq!(results[0].0, 4);
+        // Node 2 (2,0) should be second closest
+        assert_eq!(results[1].0, 2);
+        // Distances should be sorted
+        assert!(results[0].1 <= results[1].1);
+        assert!(results[1].1 <= results[2].1);
+    }
+
+    #[test]
+    fn test_beam_search_with_filter() {
+        // Same 5-node graph as above
+        let positions: Vec<[f32; 2]> = vec![
+            [0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 1.0],
+        ];
+        let neighbors: Vec<Vec<u32>> = vec![
+            vec![1, 3], vec![0, 2], vec![1, 4], vec![0, 4], vec![2, 3],
+        ];
+
+        // Query near node 4, but filter out nodes 4 and 2 (even IDs only allowed: 0, 2, 4... but let's filter for odd IDs)
+        let query = [2.1f32, 0.9];
+
+        let results = beam_search(
+            &[0],
+            5,
+            3,
+            |id| {
+                let p = &positions[id as usize];
+                ((query[0] - p[0]).powi(2) + (query[1] - p[1]).powi(2)).sqrt()
+            },
+            |id| neighbors[id as usize].clone(),
+            |id| id % 2 == 1, // only odd IDs: 1 and 3
+            BeamSearchConfig {
+                expanded_beam: Some(10),
+                max_iterations: Some(20),
+                early_term_factor: Some(1.5),
+            },
+        );
+
+        // Should only contain odd IDs
+        for (id, _) in &results {
+            assert!(id % 2 == 1, "Expected only odd IDs, got {}", id);
+        }
+        // Should find at least nodes 1 and 3
+        let ids: HashSet<u32> = results.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&3));
+    }
+
+    #[test]
+    fn test_prune_neighbors_alpha() {
+        // 3 candidates around node 0:
+        //   node 1 at distance 1.0
+        //   node 2 at distance 1.5 but close to node 1 (should be pruned with high alpha)
+        //   node 3 at distance 2.0 but far from both (should survive)
+        let vectors = vec![
+            vec![0.0, 0.0], // node 0 (center)
+            vec![1.0, 0.0], // node 1
+            vec![1.2, 0.0], // node 2 (close to node 1)
+            vec![0.0, 2.0], // node 3 (far from node 1)
+        ];
+
+        let candidates: Vec<(u32, f32)> = vec![
+            (1, DistL2 {}.eval(&vectors[0], &vectors[1])),
+            (2, DistL2 {}.eval(&vectors[0], &vectors[2])),
+            (3, DistL2 {}.eval(&vectors[0], &vectors[3])),
+        ];
+
+        // With alpha=1.0 (strict pruning), node 2 should be pruned because
+        // dist(1,2) < alpha * dist(0,2), meaning node 1 is a better representative
+        let pruned = prune_neighbors(0, &candidates, &vectors, 3, 1.0, DistL2 {});
+
+        // Node 1 should always be included (closest)
+        assert!(pruned.contains(&1));
+        // Node 3 should be included (it's in a different direction)
+        assert!(pruned.contains(&3));
+        // With strict alpha=1.0 and max_degree=3, node 2 might still be added in the fill phase
+        // but the alpha-pruning step itself should prefer diverse directions
+    }
+
+    #[test]
+    fn test_prune_neighbors_max_degree() {
+        let vectors = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![1.0, 1.0],
+            vec![2.0, 0.0],
+            vec![0.0, 2.0],
+        ];
+
+        let candidates: Vec<(u32, f32)> = (1..6)
+            .map(|i| (i as u32, DistL2 {}.eval(&vectors[0], &vectors[i])))
+            .collect();
+
+        // max_degree=2: should return at most 2 neighbors
+        let pruned = prune_neighbors(0, &candidates, &vectors, 2, 1.2, DistL2 {});
+        assert_eq!(pruned.len(), 2);
+        assert!(!pruned.is_empty());
+
+        // max_degree=5: should return all 5
+        let pruned = prune_neighbors(0, &candidates, &vectors, 5, 1.2, DistL2 {});
+        assert_eq!(pruned.len(), 5);
+
+        // max_degree=1: should return exactly 1 (the closest)
+        let pruned = prune_neighbors(0, &candidates, &vectors, 1, 1.2, DistL2 {});
+        assert_eq!(pruned.len(), 1);
+    }
+
+    #[test]
+    fn test_core_magic_number_in_bytes() {
+        let path = "test_magic.db";
+        let _ = fs::remove_file(path);
+
+        let vectors = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, path).unwrap();
+        let bytes = index.to_bytes();
+
+        // First 4 bytes should be CORE_MAGIC
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(magic, CORE_MAGIC, "Expected magic 0x{:08X}, got 0x{:08X}", CORE_MAGIC, magic);
+
+        // Next 4 bytes should be version
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        assert_eq!(version, CORE_FORMAT_VERSION);
 
         let _ = fs::remove_file(path);
     }

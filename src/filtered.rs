@@ -42,15 +42,63 @@
 //! let results = index.search_filtered(&query, 10, 128, &filter);
 //! ```
 
-use crate::{DiskANN, DiskAnnError, DiskAnnParams};
+use crate::{beam_search, BeamSearchConfig, GraphIndex, DiskANN, DiskAnnError, DiskAnnParams};
 use anndists::prelude::Distance;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BinaryHeap, HashSet};
-use std::cmp::{Ordering, Reverse};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::Arc;
+
+/// Shared filtered search implementation usable with any `GraphIndex`.
+///
+/// Uses expanded beam search that skips non-matching candidates but
+/// continues exploring the graph to find matches.
+pub(crate) fn filtered_search(
+    graph: &dyn GraphIndex,
+    labels: &[Vec<u64>],
+    start_ids: &[u32],
+    query: &[f32],
+    k: usize,
+    beam_width: usize,
+    filter: &Filter,
+) -> Vec<(u32, f32)> {
+    if matches!(filter, Filter::None) {
+        return beam_search(
+            start_ids,
+            beam_width,
+            k,
+            |id| graph.distance_to(query, id),
+            |id| graph.get_neighbors(id),
+            |_| true,
+            BeamSearchConfig::default(),
+        );
+    }
+
+    let expanded_beam = (beam_width * 4).max(k * 10);
+
+    beam_search(
+        start_ids,
+        beam_width,
+        k,
+        |id| graph.distance_to(query, id),
+        |id| graph.get_neighbors(id),
+        |id| {
+            let idx = id as usize;
+            if idx < labels.len() {
+                filter.matches(&labels[idx])
+            } else {
+                false
+            }
+        },
+        BeamSearchConfig {
+            expanded_beam: Some(expanded_beam),
+            max_iterations: Some(expanded_beam * 2),
+            early_term_factor: Some(1.5),
+        },
+    )
+}
 
 /// A single filter condition
 #[derive(Clone, Debug)]
@@ -142,30 +190,6 @@ impl Filter {
 struct FilteredMetadata {
     num_vectors: usize,
     num_fields: usize,
-}
-
-/// Candidate for filtered search
-#[derive(Clone, Copy)]
-struct Candidate {
-    dist: f32,
-    id: u32,
-}
-
-impl PartialEq for Candidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.dist == other.dist && self.id == other.id
-    }
-}
-impl Eq for Candidate {}
-impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.dist.partial_cmp(&other.dist)
-    }
-}
-impl Ord for Candidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
-    }
 }
 
 /// DiskANN index with metadata filtering support
@@ -476,106 +500,15 @@ where
         beam_width: usize,
         filter: &Filter,
     ) -> Vec<(u32, f32)> {
-        // For unfiltered search, use the fast path
-        if matches!(filter, Filter::None) {
-            return self.index.search_with_dists(query, k, beam_width);
-        }
-
-        // Filtered search: we need to explore more of the graph
-        // Use larger internal beam to find enough matching candidates
-        let expanded_beam = (beam_width * 4).max(k * 10);
-
-        let mut visited = HashSet::new();
-        let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
-        let mut working_set: BinaryHeap<Candidate> = BinaryHeap::new();
-        let mut results: Vec<(u32, f32)> = Vec::with_capacity(k);
-
-        // Seed from medoid
-        let start_dist = self.distance_to(query, self.index.medoid_id as usize);
-        let start = Candidate {
-            dist: start_dist,
-            id: self.index.medoid_id,
-        };
-        frontier.push(Reverse(start));
-        working_set.push(start);
-        visited.insert(self.index.medoid_id);
-
-        // Check if medoid matches filter
-        if filter.matches(&self.labels[self.index.medoid_id as usize]) {
-            results.push((self.index.medoid_id, start_dist));
-        }
-
-        // Expand until we have k results or exhausted search
-        let mut iterations = 0;
-        let max_iterations = expanded_beam * 2;
-
-        while let Some(Reverse(best)) = frontier.peek().copied() {
-            iterations += 1;
-            if iterations > max_iterations {
-                break;
-            }
-
-            // Early termination if we have enough results and best candidate
-            // can't improve our worst result
-            if results.len() >= k {
-                if let Some((_, worst_dist)) = results.last() {
-                    if best.dist > *worst_dist * 1.5 {
-                        break;
-                    }
-                }
-            }
-
-            if working_set.len() >= expanded_beam {
-                if let Some(worst) = working_set.peek() {
-                    if best.dist >= worst.dist {
-                        break;
-                    }
-                }
-            }
-
-            let Reverse(current) = frontier.pop().unwrap();
-
-            // Explore neighbors
-            for &nb in self.get_neighbors(current.id) {
-                if nb == u32::MAX {
-                    continue;
-                }
-                if !visited.insert(nb) {
-                    continue;
-                }
-
-                let d = self.distance_to(query, nb as usize);
-                let cand = Candidate { dist: d, id: nb };
-
-                // Always add to working set for graph exploration
-                if working_set.len() < expanded_beam {
-                    working_set.push(cand);
-                    frontier.push(Reverse(cand));
-                } else if d < working_set.peek().unwrap().dist {
-                    working_set.pop();
-                    working_set.push(cand);
-                    frontier.push(Reverse(cand));
-                }
-
-                // Check filter for results
-                if filter.matches(&self.labels[nb as usize]) {
-                    // Insert into results maintaining sorted order
-                    let pos = results
-                        .iter()
-                        .position(|(_, dist)| d < *dist)
-                        .unwrap_or(results.len());
-
-                    if pos < k {
-                        results.insert(pos, (nb, d));
-                        if results.len() > k {
-                            results.pop();
-                        }
-                    }
-                }
-            }
-        }
-
-        results
+        filtered_search(
+            &self.index,
+            &self.labels,
+            &[self.index.medoid_id],
+            query,
+            k,
+            beam_width,
+            filter,
+        )
     }
 
     /// Parallel batch filtered search
@@ -622,24 +555,6 @@ where
         self.labels.iter().filter(|l| filter.matches(l)).count()
     }
 
-    fn get_neighbors(&self, node_id: u32) -> &[u32] {
-        // Access internal neighbors through the index
-        let offset = self.index.adjacency_offset
-            + (node_id as u64 * self.index.max_degree as u64 * 4);
-        let start = offset as usize;
-        let end = start + (self.index.max_degree * 4);
-        let bytes = &self.index.storage[start..end];
-        bytemuck::cast_slice(bytes)
-    }
-
-    fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
-        let offset = self.index.vectors_offset + (idx as u64 * self.index.dim as u64 * 4);
-        let start = offset as usize;
-        let end = start + (self.index.dim * 4);
-        let bytes = &self.index.storage[start..end];
-        let vector: &[f32] = bytemuck::cast_slice(bytes);
-        self.index.dist.eval(query, vector)
-    }
 }
 
 #[cfg(test)]

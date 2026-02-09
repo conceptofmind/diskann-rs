@@ -1,6 +1,6 @@
 [package]
 name = "diskann-rs"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "A Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search) using the Vamana graph algorithm. Provides memory-efficient vector search through graph traversal and memory-mapped storage, enabling billion-scale search with minimal RAM usage."
 license = "MIT" 
@@ -15,11 +15,11 @@ thiserror = "1.0"
 bytemuck = { version = "1.14", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
 rayon = "1.10"
-ndarray = { version = "0.16" }
 anndists = {version = "0.1.3", default-features = false}
 log = { version = "0.4" }
 
 [dev-dependencies]
+ndarray = { version = "0.16" }
 cpu-time = "1.0.0"
 byteorder = "1.5.0"
 plotters = { version = "0.3", default-features = false, features = ["svg_backend", "line_series"] }

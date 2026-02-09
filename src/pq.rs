@@ -91,6 +91,12 @@ impl ProductQuantizer {
         }
 
         let dim = vectors[0].len();
+        if config.num_centroids > 256 {
+            return Err(DiskAnnError::IndexError(format!(
+                "num_centroids {} exceeds 256 (codes are u8)",
+                config.num_centroids
+            )));
+        }
         if dim % config.num_subspaces != 0 {
             return Err(DiskAnnError::IndexError(format!(
                 "Dimension {} not divisible by num_subspaces {}",

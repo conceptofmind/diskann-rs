@@ -23,6 +23,7 @@ A Rust implementation of [DiskANN](https://proceedings.neurips.cc/paper_files/pa
 |---------|-------------|
 | **Incremental Updates** | Add/delete vectors without rebuilding the entire index |
 | **Filtered Search** | Query with metadata predicates (e.g., category filters) |
+| **Composable Features** | Combine incremental + filtered + quantized on a single index |
 | **SIMD Acceleration** | Optimized distance calculations (AVX2, SSE4.1, NEON) |
 | **Product Quantization** | Compress vectors up to 64x with PQ encoding |
 | **Scalar Quantization** | F16 (2x) and Int8 (4x) compression with SIMD-accelerated distance |
@@ -92,6 +93,38 @@ let filter = Filter::and(vec![
     Filter::label_eq(0, 5),           // category == 5
     Filter::label_range(1, 10, 100),  // price in [10, 100]
 ]);
+```
+
+### Composable Incremental Index (Filtered + Quantized + Incremental)
+
+```rust
+use anndists::dist::DistL2;
+use diskann_rs::{IncrementalDiskANN, IncrementalQuantizedConfig, QuantizerKind, Filter};
+
+// Build an incremental index with labels and F16 quantization
+let vectors = vec![vec![0.0; 128]; 1000];
+let labels: Vec<Vec<u64>> = (0..1000).map(|i| vec![i % 5]).collect();
+let quant_config = IncrementalQuantizedConfig { rerank_size: 50 };
+
+let index = IncrementalDiskANN::<DistL2>::build_full(
+    &vectors, &labels, "composable.db",
+    Default::default(),              // IncrementalConfig
+    QuantizerKind::F16,
+    quant_config,
+)?;
+
+// Filtered search on the incremental index
+let filter = Filter::label_eq(0, 3);
+let results = index.search_filtered(&query, 10, 128, &filter);
+
+// Add labeled vectors without rebuilding
+let new_vecs = vec![vec![1.0; 128]; 50];
+let new_labels = vec![vec![2u64]; 50];
+index.add_vectors_with_labels(&new_vecs, &new_labels)?;
+
+// Delete, compact, serialize — all features compose
+index.delete_vectors(&[0, 1, 2])?;
+let bytes = index.to_bytes();
 ```
 
 ### Product Quantization (64x Compression)
@@ -305,20 +338,26 @@ All variants deref to &[u8], so search logic is unified.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Incremental Updates (Delta Layer)
+### Incremental Updates (Composable Delta Layer)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                  IncrementalDiskANN                         │
-├─────────────────────────────────────────────────────────────┤
-│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────┐  │
-│  │   Base Index     │  │   Delta Layer    │  │ Tombstones│  │
-│  │   (mmap file)    │  │   (in-memory)    │  │  (BitSet) │  │
-│  │                  │  │   + mini-graph   │  │           │  │
-│  └──────────────────┘  └──────────────────┘  └───────────┘  │
-└─────────────────────────────────────────────────────────────┘
-
-Search: query base → merge delta → filter tombstones → return
+┌──────────────────────────────────────────────────────────────┐
+│                   IncrementalDiskANN                          │
+├──────────────────────────────────────────────────────────────┤
+│  ┌───────────────┐  ┌───────────────┐  ┌──────────────────┐  │
+│  │  Base Index   │  │  Delta Layer  │  │   Tombstones     │  │
+│  │  (mmap file)  │  │  (in-memory)  │  │   (HashSet)      │  │
+│  │  + labels?    │  │  + mini-graph │  │                  │  │
+│  │  + codes?     │  │  + labels?    │  │                  │  │
+│  └───────┬───────┘  └───────┬───────┘  └──────────────────┘  │
+│          └──────────┬───────┘                                │
+│              UnifiedView (GraphIndex trait)                   │
+│          multi-seed beam search over both                    │
+├──────────────────────────────────────────────────────────────┤
+│  Optional:  Labels → search_filtered()                       │
+│             Quantizer → quantized distance (base codes)      │
+│             Both → filtered + quantized search               │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Parameters
@@ -362,6 +401,7 @@ DISKANN_BENCH_LARGE=1 cargo bench --bench benchmark
 |---------|------------|--------------|
 | Incremental updates | Yes | No |
 | Filtered search | Yes | No |
+| Composable features | Yes (incremental + filtered + quantized) | No |
 | Product Quantization | Yes (64x) | No |
 | Scalar Quantization | Yes (F16 2x, Int8 4x) | No |
 | Byte loading (no files) | Yes | No |
