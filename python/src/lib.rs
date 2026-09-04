@@ -11,6 +11,7 @@ use pyo3::types::PyBytes;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+// Metric selected by const param: 0 = l2 (squared), 1 = cosine, 2 = dot.
 #[derive(Clone, Copy, Default)]
 struct M<const K: u8>;
 impl<const K: u8> Distance<f32> for M<K> {
@@ -140,6 +141,7 @@ impl PyIncremental {
             Some("f16") => Some(QuantizerKind::F16),
             Some("int8") => Some(QuantizerKind::Int8),
             Some("pq") => Some(QuantizerKind::PQ(PQConfig { num_subspaces: pq_subspaces, ..Default::default() })),
+            Some("rabitq") => Some(QuantizerKind::RaBitQ),
             Some(q) => return Err(PyValueError::new_err(format!("unknown quantizer: {q}"))),
         };
         py.detach(|| Ok(Self(mk!(metric, match (labels, qk) {
@@ -148,6 +150,7 @@ impl PyIncremental {
             (None, Some(QuantizerKind::F16)) => IncrementalDiskANN::<T>::build_quantized_f16(&vectors, path, cfg, qc),
             (None, Some(QuantizerKind::Int8)) => IncrementalDiskANN::<T>::build_quantized_int8(&vectors, path, cfg, qc),
             (None, Some(QuantizerKind::PQ(p))) => IncrementalDiskANN::<T>::build_quantized_pq(&vectors, path, cfg, p, qc),
+            (None, Some(QuantizerKind::RaBitQ)) => IncrementalDiskANN::<T>::build_quantized_rabitq(&vectors, path, cfg, qc),
             (Some(l), Some(q)) => IncrementalDiskANN::<T>::build_full(&vectors, &l, path, cfg, q, qc),
         }.map_err(err)?))))
     }
@@ -271,6 +274,7 @@ impl PyQuantized {
             "f16" => QuantizedDiskANN::<T>::build_f16(&vectors, T::default(), path, p, c),
             "int8" => QuantizedDiskANN::<T>::build_int8(&vectors, T::default(), path, p, c),
             "pq" => QuantizedDiskANN::<T>::build_pq(&vectors, T::default(), path, p, pq, c),
+            "rabitq" => QuantizedDiskANN::<T>::build_rabitq(&vectors, T::default(), path, p, c),
             q => return Err(PyValueError::new_err(format!("unknown quantizer: {q}"))),
         }.map_err(err)?))))
     }

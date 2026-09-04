@@ -55,6 +55,7 @@
 
 use crate::filtered::Filter;
 use crate::quantized::{QuantizerState, quantized_distance_from_codes};
+use crate::rabitq::RaBitQ;
 use crate::pq::{ProductQuantizer, PQConfig};
 use crate::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
 use crate::{beam_search, BeamSearchConfig, GraphIndex, DiskANN, DiskAnnError, DiskAnnParams, PAD_U32};
@@ -552,6 +553,7 @@ pub enum QuantizerKind {
     F16,
     Int8,
     PQ(PQConfig),
+    RaBitQ,
 }
 
 // =========================================================================
@@ -743,6 +745,27 @@ where
         Ok(idx)
     }
 
+    /// Build an incremental index with RaBitQ (1 bit/dim) quantization.
+    pub fn build_quantized_rabitq(
+        vectors: &[Vec<f32>],
+        file_path: &str,
+        config: IncrementalConfig,
+        quant_config: IncrementalQuantizedConfig,
+    ) -> Result<Self, DiskAnnError>
+    where
+        D: Default,
+    {
+        let mut idx = Self::build_with_config(vectors, file_path, config)?;
+        let rq = RaBitQ::train(vectors)?;
+        let code_size = rq.code_size();
+        let codes = encode_all_vecs(vectors, &rq, code_size);
+        idx.quantizer = Some(QuantizerState::RaBitQ(rq));
+        idx.base_codes = Some(codes);
+        idx.code_size = code_size;
+        idx.rerank_size = quant_config.rerank_size;
+        Ok(idx)
+    }
+
     /// Build an incremental index with Int8 quantization.
     pub fn build_quantized_int8(
         vectors: &[Vec<f32>],
@@ -835,6 +858,14 @@ where
                 let code_size = pq.stats().code_size_bytes;
                 let codes = encode_all_pq_vecs(vectors, &pq, code_size);
                 idx.quantizer = Some(QuantizerState::PQ(pq));
+                idx.base_codes = Some(codes);
+                idx.code_size = code_size;
+            }
+            QuantizerKind::RaBitQ => {
+                let rq = RaBitQ::train(vectors)?;
+                let code_size = rq.code_size();
+                let codes = encode_all_vecs(vectors, &rq, code_size);
+                idx.quantizer = Some(QuantizerState::RaBitQ(rq));
                 idx.base_codes = Some(codes);
                 idx.code_size = code_size;
             }
@@ -964,11 +995,7 @@ where
             let code_size = self.code_size;
             let rerank_size = self.rerank_size;
 
-            // Build PQ table once if PQ
-            let pq_table: Option<Vec<f32>> = match quantizer {
-                QuantizerState::PQ(pq) => Some(pq.create_distance_table(query)),
-                _ => None,
-            };
+            let prep = quantizer.prepare(query);
 
             let search_k = if rerank_size > 0 { rerank_size.max(k) } else { k };
 
@@ -989,7 +1016,7 @@ where
                     if id_usize < base_count {
                         // Use quantized distance for base vectors
                         quantized_distance_from_codes(
-                            query, id_usize, base_codes, code_size, quantizer, pq_table.as_deref(),
+                            query, id_usize, base_codes, code_size, quantizer, &prep,
                         )
                     } else {
                         // Use exact distance for delta vectors
@@ -1251,6 +1278,7 @@ where
                 QuantizerState::PQ(pq) => encode_all_pq_vecs(&all_vectors, pq, self.code_size),
                 QuantizerState::F16(f16q) => encode_all_vecs(&all_vectors, f16q, self.code_size),
                 QuantizerState::Int8(int8q) => encode_all_vecs(&all_vectors, int8q, self.code_size),
+                QuantizerState::RaBitQ(rq) => encode_all_vecs(&all_vectors, rq, self.code_size),
             };
             Some(codes)
         } else {

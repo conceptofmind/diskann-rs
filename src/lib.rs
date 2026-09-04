@@ -66,6 +66,7 @@ pub mod pq;
 pub mod storage;
 pub mod sq;
 pub mod formats;
+pub mod rabitq;
 mod quantized;
 
 pub use quantized::{QuantizedDiskANN, QuantizedConfig};
@@ -85,6 +86,8 @@ pub use pq::{ProductQuantizer, PQConfig, PQStats};
 pub use storage::Storage;
 
 pub use sq::{VectorQuantizer, F16Quantizer, Int8Quantizer};
+
+pub use rabitq::{RaBitQ, RaBitQQuery};
 
 use anndists::prelude::Distance;
 use bytemuck;

@@ -28,6 +28,7 @@
 //! ```
 
 use crate::pq::{ProductQuantizer, PQConfig};
+use crate::rabitq::{RaBitQ, RaBitQQuery};
 use crate::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
 use crate::{beam_search, BeamSearchConfig, GraphIndex, DiskANN, DiskAnnError, DiskAnnParams};
 use anndists::prelude::Distance;
@@ -44,21 +45,25 @@ pub(crate) fn quantized_distance_from_codes(
     codes: &[u8],
     code_size: usize,
     quantizer: &QuantizerState,
-    pq_table: Option<&[f32]>,
+    prep: &Prepared,
 ) -> f32 {
     let code_start = idx * code_size;
     let code = &codes[code_start..code_start + code_size];
-    match quantizer {
-        QuantizerState::PQ(pq) => {
-            if let Some(table) = pq_table {
-                pq.distance_with_table(table, code)
-            } else {
-                pq.asymmetric_distance(query, code)
-            }
-        }
-        QuantizerState::F16(f16q) => f16q.asymmetric_distance(query, code),
-        QuantizerState::Int8(int8q) => int8q.asymmetric_distance(query, code),
+    match (quantizer, prep) {
+        (QuantizerState::PQ(pq), Prepared::Table(table)) => pq.distance_with_table(table, code),
+        (QuantizerState::PQ(pq), _) => pq.asymmetric_distance(query, code),
+        (QuantizerState::RaBitQ(rq), Prepared::RaBitQ(q)) => rq.distance(q, code),
+        (QuantizerState::RaBitQ(rq), _) => rq.asymmetric_distance(query, code),
+        (QuantizerState::F16(f16q), _) => f16q.asymmetric_distance(query, code),
+        (QuantizerState::Int8(int8q), _) => int8q.asymmetric_distance(query, code),
     }
+}
+
+/// Per-query precomputed state (PQ distance table or RaBitQ query).
+pub(crate) enum Prepared {
+    None,
+    Table(Vec<f32>),
+    RaBitQ(RaBitQQuery),
 }
 
 /// Shared quantized search implementation usable with any `GraphIndex`.
@@ -78,11 +83,7 @@ pub(crate) fn quantized_search(
     filter_fn: impl Fn(u32) -> bool,
     config: BeamSearchConfig,
 ) -> Vec<(u32, f32)> {
-    // Pre-query: build PQ distance table if applicable
-    let pq_table: Option<Vec<f32>> = match quantizer {
-        QuantizerState::PQ(pq) => Some(pq.create_distance_table(query)),
-        _ => None,
-    };
+    let prep = quantizer.prepare(query);
 
     let search_k = if rerank_size > 0 { rerank_size.max(k) } else { k };
 
@@ -90,7 +91,7 @@ pub(crate) fn quantized_search(
         start_ids,
         beam_width,
         search_k,
-        |id| quantized_distance_from_codes(query, id as usize, codes, code_size, quantizer, pq_table.as_deref()),
+        |id| quantized_distance_from_codes(query, id as usize, codes, code_size, quantizer, &prep),
         |id| graph.get_neighbors(id),
         &filter_fn,
         config,
@@ -140,6 +141,7 @@ pub(crate) enum QuantizerState {
     PQ(ProductQuantizer),
     F16(F16Quantizer),
     Int8(Int8Quantizer),
+    RaBitQ(RaBitQ),
 }
 
 impl QuantizerState {
@@ -148,6 +150,15 @@ impl QuantizerState {
             QuantizerState::PQ(_) => 0,
             QuantizerState::F16(_) => 1,
             QuantizerState::Int8(_) => 2,
+            QuantizerState::RaBitQ(_) => 3,
+        }
+    }
+
+    pub(crate) fn prepare(&self, query: &[f32]) -> Prepared {
+        match self {
+            QuantizerState::PQ(pq) => Prepared::Table(pq.create_distance_table(query)),
+            QuantizerState::RaBitQ(rq) => Prepared::RaBitQ(rq.query(query)),
+            _ => Prepared::None,
         }
     }
 
@@ -215,6 +226,20 @@ where
             codes,
             code_size,
             quantizer: QuantizerState::F16(f16q),
+            rerank_size: config.rerank_size,
+        }
+    }
+
+    /// Create from an existing index and a trained RaBitQ quantizer.
+    pub fn from_rabitq(base: DiskANN<D>, rq: RaBitQ, config: QuantizedConfig) -> Self {
+        let n = base.num_vectors;
+        let code_size = rq.code_size();
+        let codes = encode_all_generic(&base, &rq, n, code_size);
+        Self {
+            base,
+            codes,
+            code_size,
+            quantizer: QuantizerState::RaBitQ(rq),
             rerank_size: config.rerank_size,
         }
     }
@@ -594,6 +619,19 @@ where
     ) -> Result<Self, DiskAnnError> {
         let base = DiskANN::build_index_with_params(vectors, dist, file_path, ann_params)?;
         Ok(Self::from_f16(base, config))
+    }
+
+    /// Build a RaBitQ-quantized (1 bit/dim) index from scratch.
+    pub fn build_rabitq(
+        vectors: &[Vec<f32>],
+        dist: D,
+        file_path: &str,
+        ann_params: DiskAnnParams,
+        config: QuantizedConfig,
+    ) -> Result<Self, DiskAnnError> {
+        let base = DiskANN::build_index_with_params(vectors, dist, file_path, ann_params)?;
+        let rq = RaBitQ::train(vectors)?;
+        Ok(Self::from_rabitq(base, rq, config))
     }
 
     /// Build an Int8-quantized index from scratch.
