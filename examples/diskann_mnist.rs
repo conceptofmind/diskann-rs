@@ -1,9 +1,9 @@
 // examples/diskann_mnist.rs
 #![allow(clippy::needless_range_loop)]
 
-use anndists::dist::DistL2;
+
 use cpu_time::ProcessTime;
-use diskann_rs::{DiskANN, DiskAnnError, DiskAnnParams};
+use diskann_rs::{DiskANN, DiskAnnError, DiskAnnParams, DistL2};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};

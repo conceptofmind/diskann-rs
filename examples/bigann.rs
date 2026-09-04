@@ -11,9 +11,8 @@
 //!   (then mmaps it). Building on the full dataset requires a lot of RAM.
 //!   Adjust NB_DATA_POINTS to a subset if needed.
 
-use anndists::dist::DistL2;
 use byteorder::{LittleEndian, ReadBytesExt};
-use diskann_rs::{DiskANN, DiskAnnParams};
+use diskann_rs::{DiskANN, DiskAnnParams, DistL2};
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};

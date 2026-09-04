@@ -204,12 +204,12 @@ impl AnnBenchmarkData {
     /// do l2 normalisation of test and train vector to use DistDot metrinc instead DistCosine to spare cpu
     #[allow(unused)]
     pub fn do_l2_normalization(&mut self) {
-        for i in 0..self.test_data.len() {
-            anndists::dist::l2_normalize(&mut self.test_data[i]);
-        }
-        for i in 0..self.train_data.len() {
-            anndists::dist::l2_normalize(&mut self.train_data[i].0);
-        }
+        let normalize = |v: &mut Vec<f32>| {
+            let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= n);
+        };
+        self.test_data.iter_mut().for_each(normalize);
+        self.train_data.iter_mut().for_each(|(v, _)| normalize(v));
     } // end of do_l2_normalization
 } // end of impl block
 

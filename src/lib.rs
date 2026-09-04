@@ -9,7 +9,7 @@
 //!
 //! ## Example
 //! ```no_run
-//! use anndists::dist::{DistL2, DistCosine};
+//! use crate::{DistL2, DistCosine};
 //! use diskann_rs::{DiskANN, DiskAnnParams};
 //!
 //! // Build a new index from vectors, using L2 and default params
@@ -61,7 +61,7 @@
 
 mod incremental;
 mod filtered;
-pub mod simd;
+mod metric;
 pub mod pq;
 pub mod storage;
 pub mod sq;
@@ -79,8 +79,6 @@ pub use incremental::{
 
 pub use filtered::{FilteredDiskANN, Filter};
 
-pub use simd::{SimdL2, SimdDot, SimdCosine, simd_info};
-
 pub use pq::{ProductQuantizer, PQConfig, PQStats};
 
 pub use storage::Storage;
@@ -89,7 +87,7 @@ pub use sq::{VectorQuantizer, F16Quantizer, Int8Quantizer};
 
 pub use rabitq::{RaBitQ, RaBitQQuery};
 
-use anndists::prelude::Distance;
+pub use metric::{simd_info, DistCosine, DistDot, DistL2, DistL2Sq, Distance};
 use bytemuck;
 use rand::prelude::*;
 use rayon::prelude::*;
@@ -1104,7 +1102,7 @@ fn build_incoming_csr(order: &[usize], new_graph: &[Vec<u32>], n: usize) -> (Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anndists::dist::{DistCosine, DistL2};
+    use crate::{DistCosine, DistL2};
     use rand::Rng;
     use std::fs;
 

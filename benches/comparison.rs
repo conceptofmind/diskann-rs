@@ -8,9 +8,8 @@
 //!
 //! Run with: cargo bench --release --bench comparison
 
-use anndists::dist::DistL2;
-use diskann_rs::{DiskANN, DiskAnnParams, IncrementalDiskANN};
-use hnsw_rs::prelude::*;
+use diskann_rs::{DiskANN, DiskAnnParams, DistL2, IncrementalDiskANN};
+use hnsw_rs::prelude::{DistL2 as HnswL2, Hnsw};
 use plotters::prelude::*;
 use rand::prelude::*;
 use rayon::prelude::*;
@@ -122,7 +121,7 @@ fn benchmark_build_time() -> Vec<BuildResult> {
         // hnsw_rs
         {
             let start = Instant::now();
-            let hnsw = Hnsw::<f32, DistL2>::new(32, n, 16, 64, DistL2 {});
+            let hnsw = Hnsw::<f32, HnswL2>::new(32, n, 16, 64, HnswL2 {});
 
             let data_refs: Vec<(&Vec<f32>, usize)> = data.iter().zip(0..n).collect();
             hnsw.parallel_insert(&data_refs);
@@ -253,7 +252,7 @@ fn benchmark_recall_qps() -> Vec<RecallQpsResult> {
 
     println!("Building hnsw_rs index...");
     // Hnsw::new(max_nb_conn M, capacity, max_layer, ef_construction, distance)
-    let mut hnsw = Hnsw::<f32, DistL2>::new(64, n, 16, 128, DistL2 {});
+    let mut hnsw = Hnsw::<f32, HnswL2>::new(32, n, 16, 64, HnswL2 {});
     let data_refs: Vec<(&Vec<f32>, usize)> = data.iter().zip(0..n).collect();
     hnsw.parallel_insert(&data_refs);
 
@@ -451,7 +450,7 @@ fn benchmark_memory() -> Vec<MemoryResult> {
     // Build hnsw_rs index and measure its RAM requirement
     println!("Building hnsw_rs index...");
     let hnsw_before = measure_process_rss();
-    let mut hnsw = Hnsw::<f32, DistL2>::new(64, n, 16, 128, DistL2 {});
+    let mut hnsw = Hnsw::<f32, HnswL2>::new(32, n, 16, 64, HnswL2 {});
     let data_refs: Vec<(&Vec<f32>, usize)> = data.iter().zip(0..n).collect();
     hnsw.parallel_insert(&data_refs);
     hnsw.set_searching_mode(true);
@@ -731,7 +730,7 @@ fn benchmark_incremental() -> Vec<IncrementalResult> {
 
     // hnsw_rs - can add but cannot delete
     {
-        let hnsw = Hnsw::<f32, DistL2>::new(32, initial_n + add_n, 16, 64, DistL2 {});
+        let hnsw = Hnsw::<f32, HnswL2>::new(32, initial_n + add_n, 16, 64, HnswL2 {});
         let data_refs: Vec<(&Vec<f32>, usize)> = initial_data.iter().zip(0..initial_n).collect();
         hnsw.parallel_insert(&data_refs);
 

@@ -26,7 +26,7 @@
 //! ```
 
 use crate::DiskAnnError;
-use half::f16;
+use numkong::{cast, f16, EachScale, Euclidean};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -50,6 +50,11 @@ pub trait VectorQuantizer: Send + Sync {
 // F16 Quantizer
 // =============================================================================
 
+pub(crate) fn f16_codes(codes: &[u8]) -> &[f16] {
+    let bits: &[u16] = bytemuck::cast_slice(codes);
+    unsafe { std::slice::from_raw_parts(bits.as_ptr().cast(), bits.len()) } // f16 is repr(transparent) over u16
+}
+
 /// Half-precision (f16) quantizer.
 ///
 /// Each f32 dimension is stored as f16 (2 bytes), giving 2x compression.
@@ -68,6 +73,16 @@ impl F16Quantizer {
     /// Get the vector dimension.
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    pub fn prepare(&self, query: &[f32]) -> Vec<f16> {
+        let mut q = vec![f16::ZERO; self.dim];
+        cast(query, &mut q).expect("Vector dimension mismatch");
+        q
+    }
+    #[inline]
+    pub fn distance_f16(&self, query: &[f16], codes: &[u8]) -> f32 {
+        f16::sqeuclidean(query, f16_codes(codes)).expect("Code length mismatch")
     }
 
     /// Save to file.
@@ -99,29 +114,13 @@ impl F16Quantizer {
 }
 
 impl VectorQuantizer for F16Quantizer {
-    fn encode(&self, vector: &[f32]) -> Vec<u8> {
-        assert_eq!(vector.len(), self.dim, "Vector dimension mismatch");
-        let mut codes = Vec::with_capacity(self.dim * 2);
-        for &val in vector {
-            codes.extend_from_slice(&f16::from_f32(val).to_le_bytes());
-        }
-        codes
-    }
-
+    fn encode(&self, vector: &[f32]) -> Vec<u8> { self.prepare(vector).iter().flat_map(|h| h.0.to_le_bytes()).collect() }
     fn decode(&self, codes: &[u8]) -> Vec<f32> {
-        assert_eq!(codes.len(), self.dim * 2, "Code length mismatch");
-        let u16_slice: &[u16] = bytemuck::cast_slice(codes);
-        let mut output = vec![0.0f32; self.dim];
-        crate::simd::f16_to_f32_bulk(u16_slice, &mut output);
-        output
+        let mut out = vec![0.0f32; self.dim];
+        cast(f16_codes(codes), &mut out).expect("Code length mismatch");
+        out
     }
-
-    fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 {
-        assert_eq!(query.len(), self.dim, "Query dimension mismatch");
-        assert_eq!(codes.len(), self.dim * 2, "Code length mismatch");
-        let u16_slice: &[u16] = bytemuck::cast_slice(codes);
-        crate::simd::l2_f16_vs_f32(u16_slice, query)
-    }
+    fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 { self.distance_f16(&self.prepare(query), codes) }
 
     fn compression_ratio(&self, dim: usize) -> f32 {
         (dim * 4) as f32 / (dim * 2) as f32
@@ -139,73 +138,30 @@ impl VectorQuantizer for F16Quantizer {
 ///
 /// Trained from sample vectors to learn the per-dimension ranges.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Int8Quantizer {
-    dim: usize,
-    /// Per-dimension scale: (max - min) / 255.0
-    scales: Vec<f32>,
-    /// Per-dimension offset: min value
-    offsets: Vec<f32>,
-}
+pub struct Int8Quantizer { dim: usize, scale: f32, offset: f32 }
 
 impl Int8Quantizer {
-    /// Train an Int8 quantizer from sample vectors.
-    ///
-    /// Computes per-dimension min/max to establish the affine mapping.
     pub fn train(vectors: &[Vec<f32>]) -> Result<Self, DiskAnnError> {
-        if vectors.is_empty() {
-            return Err(DiskAnnError::IndexError("No vectors to train on".into()));
-        }
-
-        let dim = vectors[0].len();
-        let mut mins = vec![f32::MAX; dim];
-        let mut maxs = vec![f32::MIN; dim];
-
+        let dim = vectors.first().map(|v| v.len()).ok_or_else(|| DiskAnnError::IndexError("No vectors to train on".into()))?;
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
         for v in vectors {
-            if v.len() != dim {
-                return Err(DiskAnnError::IndexError(format!(
-                    "Dimension mismatch: expected {}, got {}", dim, v.len()
-                )));
-            }
-            for (i, &val) in v.iter().enumerate() {
-                if val < mins[i] { mins[i] = val; }
-                if val > maxs[i] { maxs[i] = val; }
-            }
+            if v.len() != dim { return Err(DiskAnnError::IndexError(format!("Dimension mismatch: expected {}, got {}", dim, v.len()))); }
+            for &x in v { lo = lo.min(x); hi = hi.max(x); }
         }
-
-        let mut scales = Vec::with_capacity(dim);
-        let mut offsets = Vec::with_capacity(dim);
-
-        for i in 0..dim {
-            let range = maxs[i] - mins[i];
-            // Avoid division by zero for constant dimensions
-            let scale = if range.abs() < f32::EPSILON { 1.0 } else { range / 255.0 };
-            scales.push(scale);
-            offsets.push(mins[i]);
-        }
-
-        Ok(Self { dim, scales, offsets })
+        let range = hi - lo;
+        Ok(Self { dim, scale: if range.abs() < f32::EPSILON { 1.0 } else { range / 255.0 }, offset: lo })
     }
-
-    /// Create from pre-computed scales and offsets.
-    pub fn from_params(dim: usize, scales: Vec<f32>, offsets: Vec<f32>) -> Self {
-        assert_eq!(scales.len(), dim);
-        assert_eq!(offsets.len(), dim);
-        Self { dim, scales, offsets }
+    pub fn from_params(dim: usize, scale: f32, offset: f32) -> Self { Self { dim, scale, offset } }
+    pub fn scale(&self) -> f32 { self.scale }
+    pub fn offset(&self) -> f32 { self.offset }
+    #[inline]
+    pub fn distance_u8(&self, query: &[u8], codes: &[u8]) -> f32 {
+        u8::sqeuclidean(query, codes).expect("Code length mismatch") as f32 * self.scale * self.scale
     }
 
     /// Get the vector dimension.
     pub fn dim(&self) -> usize {
         self.dim
-    }
-
-    /// Get the per-dimension scales.
-    pub fn scales(&self) -> &[f32] {
-        &self.scales
-    }
-
-    /// Get the per-dimension offsets (min values).
-    pub fn offsets(&self) -> &[f32] {
-        &self.offsets
     }
 
     /// Save to file.
@@ -238,30 +194,14 @@ impl Int8Quantizer {
 
 impl VectorQuantizer for Int8Quantizer {
     fn encode(&self, vector: &[f32]) -> Vec<u8> {
-        assert_eq!(vector.len(), self.dim, "Vector dimension mismatch");
-        let mut codes = Vec::with_capacity(self.dim);
-        for i in 0..self.dim {
-            let normalized = (vector[i] - self.offsets[i]) / self.scales[i];
-            let clamped = normalized.clamp(0.0, 255.0);
-            codes.push(clamped.round() as u8);
-        }
+        let mut scaled = vec![0.0f32; self.dim];
+        f32::each_scale(vector, 1.0 / self.scale, -self.offset / self.scale, &mut scaled).expect("Vector dimension mismatch");
+        let mut codes = vec![0u8; self.dim];
+        cast(&scaled, &mut codes).unwrap(); // rounds + saturates to [0,255] (verified)
         codes
     }
-
-    fn decode(&self, codes: &[u8]) -> Vec<f32> {
-        assert_eq!(codes.len(), self.dim, "Code length mismatch");
-        let mut output = Vec::with_capacity(self.dim);
-        for i in 0..self.dim {
-            output.push(codes[i] as f32 * self.scales[i] + self.offsets[i]);
-        }
-        output
-    }
-
-    fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 {
-        assert_eq!(query.len(), self.dim, "Query dimension mismatch");
-        assert_eq!(codes.len(), self.dim, "Code length mismatch");
-        crate::simd::l2_u8_scaled_vs_f32(codes, query, &self.scales, &self.offsets)
-    }
+    fn decode(&self, codes: &[u8]) -> Vec<f32> { codes.iter().map(|&c| c as f32 * self.scale + self.offset).collect() }
+    fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 { self.distance_u8(&self.encode(query), codes) }
 
     fn compression_ratio(&self, dim: usize) -> f32 {
         (dim * 4) as f32 / dim as f32
@@ -428,7 +368,7 @@ mod tests {
         let expected: f32 = query.iter().zip(&decoded).map(|(a, b)| (a - b) * (a - b)).sum();
 
         // Should be very close since both use same dequantization
-        assert!((asym_dist - expected).abs() < 0.1, "asym={asym_dist}, expected={expected}");
+        assert!((asym_dist - expected).abs() < 0.01 * expected, "asym={asym_dist}, expected={expected}");
     }
 
     #[test]

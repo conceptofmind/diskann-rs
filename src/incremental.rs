@@ -30,7 +30,7 @@
 //! ## Usage
 //!
 //! ```no_run
-//! use anndists::dist::DistL2;
+//! use crate::DistL2;
 //! use diskann_rs::{IncrementalDiskANN, DiskAnnParams};
 //!
 //! // Build initial index
@@ -59,7 +59,7 @@ use crate::rabitq::RaBitQ;
 use crate::pq::{ProductQuantizer, PQConfig};
 use crate::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
 use crate::{beam_search, BeamSearchConfig, GraphIndex, DiskANN, DiskAnnError, DiskAnnParams, PAD_U32};
-use anndists::prelude::Distance;
+use crate::Distance;
 use rayon::prelude::*;
 use std::collections::{BinaryHeap, HashSet};
 use std::cmp::{Ordering, Reverse};
@@ -68,7 +68,7 @@ use std::sync::RwLock;
 /// Magic number for incremental index format: "INCR"
 const INCR_MAGIC: u32 = 0x494E4352;
 /// Current incremental format version
-const INCR_FORMAT_VERSION: u32 = 1;
+const INCR_FORMAT_VERSION: u32 = 2;
 
 /// Configuration for the incremental index behavior
 #[derive(Clone, Copy, Debug)]
@@ -1764,7 +1764,7 @@ fn encode_all_pq_vecs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anndists::dist::DistL2;
+    use crate::DistL2;
     use std::fs;
 
     fn euclid(a: &[f32], b: &[f32]) -> f32 {

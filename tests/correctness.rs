@@ -8,11 +8,10 @@
 //! - Recall regression on deterministic datasets
 //! - Cross-module consistency
 
-use anndists::dist::{DistCosine, DistL2};
 use diskann_rs::pq::{PQConfig, ProductQuantizer};
 use diskann_rs::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
 use diskann_rs::{
-    DiskANN, DiskAnnParams, Filter, FilteredDiskANN, IncrementalDiskANN,
+    DiskANN, DiskAnnParams, DistCosine, DistL2, Filter, FilteredDiskANN, IncrementalDiskANN,
     IncrementalConfig, IncrementalQuantizedConfig, QuantizerKind,
     QuantizedConfig, QuantizedDiskANN,
 };

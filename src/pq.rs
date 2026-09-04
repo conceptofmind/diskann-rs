@@ -448,15 +448,8 @@ fn kmeans(vectors: &[Vec<f32>], k: usize, iterations: usize) -> Vec<f32> {
 }
 
 /// L2 squared distance
-#[inline]
 fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
+    numkong::Euclidean::sqeuclidean(a, b).expect("dimension mismatch") as f32
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use anndists::dist::DistL2;
+//! use crate::DistL2;
 //! use diskann_rs::{QuantizedDiskANN, QuantizedConfig};
 //! use diskann_rs::pq::PQConfig;
 //!
@@ -31,7 +31,7 @@ use crate::pq::{ProductQuantizer, PQConfig};
 use crate::rabitq::{RaBitQ, RaBitQQuery};
 use crate::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
 use crate::{beam_search, BeamSearchConfig, GraphIndex, DiskANN, DiskAnnError, DiskAnnParams};
-use anndists::prelude::Distance;
+use crate::Distance;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -54,17 +54,15 @@ pub(crate) fn quantized_distance_from_codes(
         (QuantizerState::PQ(pq), _) => pq.asymmetric_distance(query, code),
         (QuantizerState::RaBitQ(rq), Prepared::RaBitQ(q)) => rq.distance(q, code),
         (QuantizerState::RaBitQ(rq), _) => rq.asymmetric_distance(query, code),
+        (QuantizerState::F16(f16q), Prepared::F16(q)) => f16q.distance_f16(q, code),
+        (QuantizerState::Int8(int8q), Prepared::U8(q)) => int8q.distance_u8(q, code),
         (QuantizerState::F16(f16q), _) => f16q.asymmetric_distance(query, code),
         (QuantizerState::Int8(int8q), _) => int8q.asymmetric_distance(query, code),
     }
 }
 
 /// Per-query precomputed state (PQ distance table or RaBitQ query).
-pub(crate) enum Prepared {
-    None,
-    Table(Vec<f32>),
-    RaBitQ(RaBitQQuery),
-}
+pub(crate) enum Prepared { Table(Vec<f32>), RaBitQ(RaBitQQuery), F16(Vec<numkong::f16>), U8(Vec<u8>) }
 
 /// Shared quantized search implementation usable with any `GraphIndex`.
 ///
@@ -116,7 +114,7 @@ pub(crate) fn quantized_search(
 /// Magic number for quantized sidecar files: "QANN"
 const MAGIC: u32 = 0x51414E4E;
 /// Current sidecar file format version
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// Configuration for quantized search.
 #[derive(Clone, Copy, Debug)]
@@ -158,7 +156,8 @@ impl QuantizerState {
         match self {
             QuantizerState::PQ(pq) => Prepared::Table(pq.create_distance_table(query)),
             QuantizerState::RaBitQ(rq) => Prepared::RaBitQ(rq.query(query)),
-            _ => Prepared::None,
+            QuantizerState::F16(f16q) => Prepared::F16(f16q.prepare(query)),
+            QuantizerState::Int8(int8q) => Prepared::U8(int8q.encode(query)),
         }
     }
 
@@ -696,7 +695,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anndists::dist::DistL2;
+    use crate::DistL2;
     use rand::prelude::*;
     use rand::SeedableRng;
     use std::collections::HashSet;

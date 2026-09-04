@@ -3,9 +3,8 @@
 //!
 //! Run with: cargo run --example quantized_search --release
 
-use anndists::dist::DistL2;
 use diskann_rs::pq::PQConfig;
-use diskann_rs::{DiskAnnParams, QuantizedConfig, QuantizedDiskANN};
+use diskann_rs::{DiskAnnParams, DistL2, QuantizedConfig, QuantizedDiskANN};
 use rand::prelude::*;
 use rand::SeedableRng;
 use std::collections::HashSet;

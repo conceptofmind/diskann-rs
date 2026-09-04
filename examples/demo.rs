@@ -1,6 +1,5 @@
 // examples/demo.rs
-use anndists::dist::DistCosine; // swap to DistL2, DistDot, etc. if desired
-use diskann_rs::{DiskANN, DiskAnnError, DiskAnnParams};
+use diskann_rs::{DiskANN, DiskAnnError, DiskAnnParams, DistCosine};
 use rand::prelude::*;
 use std::sync::Arc;
 

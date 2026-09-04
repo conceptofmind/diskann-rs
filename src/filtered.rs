@@ -23,7 +23,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use anndists::dist::DistL2;
+//! use crate::DistL2;
 //! use diskann_rs::{FilteredDiskANN, Filter};
 //!
 //! // Build index with metadata
@@ -43,7 +43,7 @@
 //! ```
 
 use crate::{beam_search, BeamSearchConfig, GraphIndex, DiskANN, DiskAnnError, DiskAnnParams};
-use anndists::prelude::Distance;
+use crate::Distance;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -560,7 +560,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anndists::dist::DistL2;
+    use crate::DistL2;
     use std::fs;
 
     #[test]

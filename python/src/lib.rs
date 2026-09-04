@@ -1,9 +1,8 @@
-use anndists::prelude::Distance;
 use diskann::pq::PQConfig;
 use diskann::{
-    formats, DiskANN, DiskAnnError, DiskAnnParams, Filter, FilteredDiskANN, IncrementalConfig,
-    IncrementalDiskANN, IncrementalQuantizedConfig, QuantizedConfig, QuantizedDiskANN,
-    QuantizerKind, SimdCosine, SimdDot, SimdL2,
+    formats, DiskANN, DiskAnnError, DiskAnnParams, DistCosine, DistDot, DistL2Sq, Filter,
+    FilteredDiskANN, IncrementalConfig, IncrementalDiskANN, IncrementalQuantizedConfig,
+    QuantizedConfig, QuantizedDiskANN, QuantizerKind,
 };
 use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -11,25 +10,13 @@ use pyo3::types::PyBytes;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
-// Metric selected by const param: 0 = l2 (squared), 1 = cosine, 2 = dot.
-#[derive(Clone, Copy, Default)]
-struct M<const K: u8>;
-impl<const K: u8> Distance<f32> for M<K> {
-    fn eval(&self, a: &[f32], b: &[f32]) -> f32 {
-        match K {
-            0 => SimdL2.eval(a, b),
-            1 => SimdCosine.eval(a, b),
-            _ => SimdDot.eval(a, b),
-        }
-    }
-}
 
 enum Any<A, B, C> {
     L2(A),
     Cos(B),
     Dot(C),
 }
-macro_rules! any { ($t:ident) => { Any<$t<M<0>>, $t<M<1>>, $t<M<2>>> } }
+macro_rules! any { ($t:ident) => { Any<$t<DistL2Sq>, $t<DistCosine>, $t<DistDot>> } }
 macro_rules! d {
     ($s:expr, $i:ident => $e:expr) => {
         match $s { Any::L2($i) => $e, Any::Cos($i) => $e, Any::Dot($i) => $e }
@@ -38,9 +25,9 @@ macro_rules! d {
 macro_rules! mk {
     ($m:expr, $e:expr) => {
         match $m {
-            "l2" => { type T = M<0>; Any::L2($e) }
-            "cosine" => { type T = M<1>; Any::Cos($e) }
-            "dot" => { type T = M<2>; Any::Dot($e) }
+            "l2" => { type T = DistL2Sq; Any::L2($e) }
+            "cosine" => { type T = DistCosine; Any::Cos($e) }
+            "dot" => { type T = DistDot; Any::Dot($e) }
             m => return Err(PyValueError::new_err(format!("unknown metric: {m}"))),
         }
     };
@@ -319,7 +306,7 @@ fn read_bvecs_as_f32(path: &str) -> PyResult<Vec<Vec<f32>>> { formats::read_bvec
 #[pyfunction]
 fn write_fvecs(path: &str, vectors: Vec<Vec<f32>>) -> PyResult<()> { formats::write_fvecs(path, &vectors).map_err(err) }
 #[pyfunction]
-fn simd_info() -> String { diskann::simd_info().to_string() }
+fn simd_info() -> String { diskann::simd_info() }
 
 #[pymodule]
 fn pydiskann(m: &Bound<'_, PyModule>) -> PyResult<()> {
