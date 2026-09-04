@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pydiskann"
-version = "0.5.1"
+version = "0.5.2"
 description = "Python bindings for diskann-rs: disk-based Vamana ANN search with filtering, incremental updates and quantization"
 readme = "README.md"
 license = "MIT"
@@ -21,3 +21,8 @@ Repository = "https://github.com/lukaesch/diskann-rs"
 [tool.maturin]
 module-name = "pydiskann"
 strip = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

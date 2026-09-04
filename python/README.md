@@ -20,5 +20,7 @@ Vectors are `list[list[float]]` (`arr.tolist()` for numpy). `l2` returns squared
 
 # Build
 ```py
-uvx --with ziglang maturin build --release --zig --compatibility manylinux_2_17 --out dist --sdist
+docker run --rm -v "$PWD":/io -w /io/python quay.io/pypa/manylinux_2_28_x86_64 bash -c \
+  'curl -sSf https://sh.rustup.rs | sh -s -- -y -q && . ~/.cargo/env && pipx run maturin build --release --sdist --out dist'
+uv publish python/dist/*
 ```
