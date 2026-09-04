@@ -16,3 +16,9 @@ idx.search(query, k=10, beam_width=128)
 ```
 
 Vectors are `list[list[float]]` (`arr.tolist()` for numpy). `l2` returns squared distances.
+
+
+# Build
+```py
+uvx --with ziglang maturin build --release --zig --compatibility manylinux_2_17 --out dist --sdist
+```

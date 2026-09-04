@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pydiskann"
-version = "0.5.0"
+version = "0.5.1"
 description = "Python bindings for diskann-rs: disk-based Vamana ANN search with filtering, incremental updates and quantization"
 readme = "README.md"
 license = "MIT"
