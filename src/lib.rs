@@ -71,7 +71,7 @@ mod quantized;
 mod spfresh;
 
 pub use quantized::{QuantizedDiskANN, QuantizedConfig};
-pub use spfresh::{SPFresh, SPFreshConfig, SPFreshStats};
+pub use spfresh::{Manifest, SPFresh, SPFreshConfig, SPFreshStats, RAW_CHUNK};
 
 pub use incremental::{
     IncrementalDiskANN, IncrementalConfig, IncrementalStats,

@@ -38,6 +38,8 @@ use std::sync::RwLock;
 
 const FREE: u64 = u64::MAX;
 const CHUNK: usize = 4096;
+/// Raw vectors per object in a snapshot.
+pub const RAW_CHUNK: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct SPFreshConfig {
@@ -69,7 +71,7 @@ pub struct SPFreshStats {
     pub max_posting: usize,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Meta {
     dim: usize,
     cfg: SPFreshConfig,
@@ -79,6 +81,17 @@ struct Meta {
     next_id: u64,
     deleted: Vec<u64>,
     live: usize,
+}
+
+/// Snapshot descriptor stored at `{prefix}/manifest` (see [`SPFresh::snapshot`]).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Manifest {
+    pub version: u64,
+    meta: Meta,
+    /// Snapshot version that last wrote each posting block (0 = never).
+    pub block_ver: Vec<u64>,
+    /// Snapshot version that last wrote each `RAW_CHUNK`-vector chunk of the raw store.
+    pub raw_chunk_ver: Vec<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -99,6 +112,10 @@ fn code_size(q: &Option<QuantizerState>, dim: usize) -> usize {
         Some(QuantizerState::PQ(p)) => p.stats().code_size_bytes,
         Some(QuantizerState::RaBitQ(r)) => r.code_size(),
     }
+}
+
+fn block_bytes(cfg: &SPFreshConfig, q: &Option<QuantizerState>, dim: usize) -> usize {
+    4 + 2 * cfg.max_posting_size * (8 + code_size(q, dim))
 }
 
 fn grow(f: &File, m: &mut MmapMut, need: usize) -> Result<(), DiskAnnError> {
@@ -144,6 +161,7 @@ fn kmeans2<D: Distance<f32> + Copy>(vs: &[&[f32]], dist: D) -> (Vec<f32>, Vec<f3
     (c1, c2, side)
 }
 
+#[cfg_attr(not(feature = "object-store"), allow(dead_code))]
 struct Inner<D>
 where
     D: Distance<f32> + Send + Sync + Copy + Clone + Default + 'static,
@@ -162,6 +180,10 @@ where
     free: Vec<(u32, u64)>,
     created: Vec<u32>,
     epoch: u64,
+    dirty: HashMap<u32, u64>,
+    write_seq: u64,
+    synced_id: u64,
+    manifest: Option<Manifest>,
     postings: MmapMut,
     postings_file: File,
     raw: MmapMut,
@@ -180,7 +202,7 @@ where
         cfg.max_posting_size = cfg.max_posting_size.max(2);
         let code_size = code_size(&quantizer, dim);
         let entry = 8 + code_size;
-        let block = 4 + 2 * cfg.max_posting_size * entry;
+        let block = block_bytes(&cfg, &quantizer, dim);
         let open = |suffix: &str, min: usize| -> Result<(File, MmapMut), DiskAnnError> {
             let f = OpenOptions::new().read(true).write(true).create(true).truncate(truncate).open(format!("{path}.{suffix}"))?;
             if (f.metadata()?.len() as usize) < min {
@@ -194,7 +216,7 @@ where
         Ok(Self {
             dim, cfg, dist: D::default(), quantizer, code_size, entry, block, graph,
             block_cid: Vec::new(), block_centroid: Vec::new(), cid_block: HashMap::new(), free: Vec::new(), created: Vec::new(), epoch: 1,
-            postings, postings_file, raw, raw_file, next_id: 0, deleted: HashSet::new(), live: 0, path: path.to_string(),
+            dirty: HashMap::new(), write_seq: 0, synced_id: 0, manifest: None, postings, postings_file, raw, raw_file, next_id: 0, deleted: HashSet::new(), live: 0, path: path.to_string(),
         })
     }
 
@@ -211,7 +233,23 @@ where
         (0..self.len(b)).map(|i| self.entry(b, i)).filter(|(id, _)| !self.deleted.contains(id)).map(|(id, c)| (id, c.to_vec())).collect()
     }
 
+    fn mark_dirty(&mut self, b: u32) {
+        if self.dirty.is_empty() {
+            let _ = std::fs::remove_file(format!("{}.cache", self.path));
+        }
+        self.write_seq += 1;
+        self.dirty.insert(b, self.write_seq);
+    }
+
+    fn meta(&self) -> Meta {
+        Meta {
+            dim: self.dim, cfg: self.cfg, quantizer: self.quantizer.clone(), block_cid: self.block_cid.clone(),
+            block_centroid: self.block_centroid.clone(), next_id: self.next_id, deleted: self.deleted.iter().copied().collect(), live: self.live,
+        }
+    }
+
     fn rewrite(&mut self, b: u32, entries: &[(u64, Vec<u8>)]) {
+        self.mark_dirty(b);
         let (block, entry) = (self.block, self.entry);
         let blk = &mut self.postings[b as usize * block..][..block];
         blk[..4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
@@ -223,6 +261,7 @@ where
     }
 
     fn push(&mut self, b: u32, id: u64, code: &[u8]) {
+        self.mark_dirty(b);
         let (n, block, entry) = (self.len(b), self.block, self.entry);
         let blk = &mut self.postings[b as usize * block..][..block];
         let e = &mut blk[4 + n * entry..][..entry];
@@ -556,11 +595,7 @@ where
         g.postings.flush()?;
         g.raw.flush()?;
         std::fs::write(format!("{}.centroids", g.path), g.graph.to_bytes())?;
-        let meta = Meta {
-            dim: g.dim, cfg: g.cfg, quantizer: g.quantizer.clone(), block_cid: g.block_cid.clone(), block_centroid: g.block_centroid.clone(),
-            next_id: g.next_id, deleted: g.deleted.iter().copied().collect(), live: g.live,
-        };
-        std::fs::write(format!("{}.spf", g.path), bincode::serialize(&meta)?)?;
+        std::fs::write(format!("{}.spf", g.path), bincode::serialize(&g.meta())?)?;
         Ok(())
     }
 
@@ -615,6 +650,174 @@ where
     }
 }
 
+#[cfg(feature = "object-store")]
+mod remote {
+    use super::*;
+    use object_store::{path::Path, ObjectStore, PutMode, PutOptions, PutPayload};
+    use std::io::{Seek, SeekFrom, Write};
+
+    fn oe(e: object_store::Error) -> DiskAnnError { DiskAnnError::IndexError(e.to_string()) }
+    async fn put(store: &dyn ObjectStore, key: String, bytes: Vec<u8>) -> Result<(), DiskAnnError> {
+        store.put(&Path::from(key), PutPayload::from(bytes)).await.map(|_| ()).map_err(oe)
+    }
+    async fn get(store: &dyn ObjectStore, key: String) -> Result<Vec<u8>, DiskAnnError> {
+        Ok(store.get(&Path::from(key)).await.map_err(oe)?.bytes().await.map_err(oe)?.to_vec())
+    }
+
+    impl<D> SPFresh<D>
+    where
+        D: Distance<f32> + Send + Sync + Copy + Clone + Default + 'static,
+    {
+        /// Upload changed posting blocks, new raw-vector chunks, the centroid graph and a new
+        /// manifest under `{prefix}/`. Layout: `v{n}/postings/{block}`, `v{n}/vectors/{chunk}`,
+        /// `v{n}/centroids`, `manifest-v{n}` (create-only: concurrent publishers fail) and
+        /// `manifest` (latest). Data is copied under a read lock, so search/insert keep running.
+        pub async fn snapshot(&self, store: &dyn ObjectStore, prefix: &str) -> Result<Manifest, DiskAnnError> {
+            let (mut m, blocks, raw, graph, next_id) = {
+                let g = self.inner.read().unwrap();
+                let base = g.manifest.as_ref();
+                let n = g.block_cid.len();
+                let dirty: Vec<(u32, u64)> = match base {
+                    None => (0..n as u32).map(|b| (b, g.dirty.get(&b).copied().unwrap_or(0))).collect(),
+                    Some(_) => g.dirty.iter().map(|(&b, &s)| (b, s)).collect(),
+                };
+                let blocks: Vec<(u32, u64, Vec<u8>)> = dirty.into_iter().map(|(b, s)| (b, s, g.blk(b).to_vec())).collect();
+                let synced = if base.is_some() { g.synced_id as usize } else { 0 };
+                let stride = RAW_CHUNK * g.dim * 4;
+                let last = (g.next_id as usize).div_ceil(RAW_CHUNK);
+                let raw: Vec<(usize, Vec<u8>)> = (synced / RAW_CHUNK..last)
+                    .map(|c| (c, g.raw[c * stride..((c + 1) * stride).min(g.next_id as usize * g.dim * 4)].to_vec()))
+                    .collect();
+                let mut block_ver = base.map_or(Vec::new(), |m| m.block_ver.clone());
+                block_ver.resize(n, 0);
+                let mut raw_chunk_ver = base.map_or(Vec::new(), |m| m.raw_chunk_ver.clone());
+                raw_chunk_ver.resize(last, 0);
+                let m = Manifest { version: base.map_or(1, |m| m.version + 1), meta: g.meta(), block_ver, raw_chunk_ver };
+                (m, blocks, raw, g.graph.to_bytes(), g.next_id)
+            };
+            let v = m.version;
+            for (b, _, bytes) in &blocks {
+                put(store, format!("{prefix}/v{v}/postings/{b}"), bytes.clone()).await?;
+                m.block_ver[*b as usize] = v;
+            }
+            for (c, bytes) in &raw {
+                put(store, format!("{prefix}/v{v}/vectors/{c}"), bytes.clone()).await?;
+                m.raw_chunk_ver[*c] = v;
+            }
+            put(store, format!("{prefix}/v{v}/centroids"), graph).await?;
+            let bytes = bincode::serialize(&m)?;
+            store
+                .put_opts(&Path::from(format!("{prefix}/manifest-v{v}")), PutPayload::from(bytes.clone()), PutOptions { mode: PutMode::Create, ..Default::default() })
+                .await
+                .map_err(|e| DiskAnnError::IndexError(format!("snapshot v{v} already published: {e}")))?;
+            put(store, format!("{prefix}/manifest"), bytes.clone()).await?;
+            let mut g = self.inner.write().unwrap();
+            for (b, s, _) in &blocks {
+                if g.dirty.get(b) == Some(s) {
+                    g.dirty.remove(b);
+                }
+            }
+            g.synced_id = g.synced_id.max(next_id);
+            g.manifest = Some(m.clone());
+            if g.dirty.is_empty() {
+                std::fs::write(format!("{}.cache", g.path), &bytes)?;
+            }
+            Ok(m)
+        }
+
+        /// Materialise the latest snapshot under `{prefix}/` into `{local}.*`, fetching only the
+        /// blocks/chunks whose version differs from `{local}.cache`, then open it.
+        pub async fn restore(store: &dyn ObjectStore, prefix: &str, local: &str) -> Result<Self, DiskAnnError> {
+            let bytes = get(store, format!("{prefix}/manifest")).await?;
+            let m: Manifest = bincode::deserialize(&bytes)?;
+            let cached: Option<Manifest> = std::fs::read(format!("{local}.cache")).ok().and_then(|b| bincode::deserialize(&b).ok());
+            let (dim, meta) = (m.meta.dim, &m.meta);
+            let block = block_bytes(&meta.cfg, &meta.quantizer, dim);
+            let stride = RAW_CHUNK * dim * 4;
+            let file = |suffix: &str, len: usize| -> Result<File, DiskAnnError> {
+                let f = OpenOptions::new().read(true).write(true).create(true).open(format!("{local}.{suffix}"))?;
+                f.set_len(len as u64)?;
+                Ok(f)
+            };
+            let mut postings = file("postings", (m.block_ver.len() * block).max(block))?;
+            for (b, &v) in m.block_ver.iter().enumerate() {
+                if cached.as_ref().and_then(|c| c.block_ver.get(b)) == Some(&v) {
+                    continue;
+                }
+                let bytes = if v == 0 { vec![0; block] } else { get(store, format!("{prefix}/v{v}/postings/{b}")).await? };
+                postings.seek(SeekFrom::Start((b * block) as u64))?;
+                postings.write_all(&bytes)?;
+            }
+            let mut vectors = file("vectors", (meta.next_id as usize * dim * 4).max(1024 * dim * 4))?;
+            for (c, &v) in m.raw_chunk_ver.iter().enumerate() {
+                if cached.as_ref().and_then(|x| x.raw_chunk_ver.get(c)) == Some(&v) {
+                    continue;
+                }
+                vectors.seek(SeekFrom::Start((c * stride) as u64))?;
+                vectors.write_all(&get(store, format!("{prefix}/v{v}/vectors/{c}")).await?)?;
+            }
+            std::fs::write(format!("{local}.centroids"), get(store, format!("{prefix}/v{}/centroids", m.version)).await?)?;
+            std::fs::write(format!("{local}.spf"), bincode::serialize(&m.meta)?)?;
+            std::fs::write(format!("{local}.cache"), &bytes)?;
+            let s = Self::open(local)?;
+            {
+                let mut g = s.inner.write().unwrap();
+                g.synced_id = g.next_id;
+                g.manifest = Some(m);
+            }
+            Ok(s)
+        }
+    }
+}
+
+#[cfg(all(test, feature = "object-store"))]
+mod remote_tests {
+    use super::tests::{cleanup, rc};
+    use super::*;
+    use crate::DistL2;
+
+    #[tokio::test]
+    async fn snapshot_restore_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("spf_store_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = object_store::local::LocalFileSystem::new_with_prefix(&dir).unwrap();
+        let (src, dst) = ("test_spf_snap_src", "test_spf_snap_dst");
+        cleanup(src);
+        cleanup(dst);
+        let vs = rc(1500, 16, 7);
+        let cfg = SPFreshConfig { max_posting_size: 32, rerank_size: 20, ..Default::default() };
+        let idx = SPFresh::<DistL2>::build(&vs, src, cfg, Some(QuantizerKind::F16)).unwrap();
+        assert_eq!(idx.snapshot(&store, "idx").await.unwrap().version, 1);
+        idx.insert(&rc(5, 16, 8)).unwrap();
+        idx.delete(&[1, 2]);
+        let m2 = idx.snapshot(&store, "idx").await.unwrap();
+        assert_eq!(m2.version, 2);
+        let touched = m2.block_ver.iter().filter(|&&v| v == 2).count();
+        assert!(touched <= 20 && touched < m2.block_ver.len(), "snapshot was not incremental: {touched}");
+        assert!(idx.inner.read().unwrap().dirty.is_empty());
+        idx.insert(&rc(295, 16, 11)).unwrap();
+        assert_eq!(idx.snapshot(&store, "idx").await.unwrap().version, 3);
+        let q = vs[3].clone();
+        let expect = idx.search_with_dists(&q, 5, 4);
+        for _ in 0..2 {
+            let r = SPFresh::<DistL2>::restore(&store, "idx", dst).await.unwrap();
+            assert_eq!(r.search_with_dists(&q, 5, 4), expect);
+            assert!(r.is_deleted(1) && r.stats().live == 1798 && r.stats().postings == idx.stats().postings);
+        }
+        let r = SPFresh::<DistL2>::restore(&store, "idx", dst).await.unwrap();
+        r.insert(&rc(10, 16, 9)).unwrap();
+        assert_eq!(r.snapshot(&store, "idx").await.unwrap().version, 4);
+        idx.insert(&rc(10, 16, 10)).unwrap();
+        assert!(idx.snapshot(&store, "idx").await.is_err(), "concurrent publish must fail");
+        cleanup(src);
+        cleanup(dst);
+        let _ = std::fs::remove_file(format!("{dst}.cache"));
+        let _ = std::fs::remove_file(format!("{src}.cache"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,15 +829,15 @@ mod tests {
     }
 
     /// 40 Gaussian clusters in [0,1]^dim with sigma 0.05 (embedding-like data).
-    fn rc(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
+    pub(super) fn rc(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
         let mut r = StdRng::seed_from_u64(seed);
         let mut cr = StdRng::seed_from_u64(99);
         let centers: Vec<Vec<f32>> = (0..40).map(|_| (0..dim).map(|_| cr.r#gen::<f32>()).collect()).collect();
         (0..n).map(|i| centers[i % 40].iter().map(|c| c + 0.05 * (r.r#gen::<f32>() - 0.5)).collect()).collect()
     }
 
-    fn cleanup(path: &str) {
-        for s in ["spf", "postings", "vectors", "centroids", "centroids.base"] {
+    pub(super) fn cleanup(path: &str) {
+        for s in ["spf", "postings", "vectors", "centroids", "centroids.base", "cache"] {
             let _ = std::fs::remove_file(format!("{path}.{s}"));
         }
     }

@@ -344,6 +344,37 @@ impl PySPFresh {
     }
     #[getter]
     fn dim(&self) -> usize { d!(&self.0, i => i.dim()) }
+    /// Incremental snapshot to `s3://bucket/prefix` (AWS_* env credentials) or `file:///dir/prefix`; returns the version.
+    #[cfg(feature = "object-store")]
+    fn snapshot(&self, py: Python<'_>, url: &str) -> PyResult<u64> {
+        let (s, prefix) = remote::store(url)?;
+        py.detach(|| d!(&self.0, i => remote::rt().block_on(i.snapshot(s.as_ref(), &prefix))).map(|m| m.version).map_err(err))
+    }
+    /// Materialise the latest snapshot at `url` into `{local}.*` and open it.
+    #[cfg(feature = "object-store")]
+    #[staticmethod]
+    #[pyo3(signature = (url, local, metric="l2"))]
+    fn restore(py: Python<'_>, url: &str, local: &str, metric: &str) -> PyResult<Self> {
+        let (s, prefix) = remote::store(url)?;
+        py.detach(|| Ok(Self(mk!(metric, remote::rt().block_on(SPFresh::<T>::restore(s.as_ref(), &prefix, local)).map_err(err)?))))
+    }
+}
+
+#[cfg(feature = "object-store")]
+mod remote {
+    use super::*;
+    use object_store::ObjectStore;
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    pub fn rt() -> &'static tokio::runtime::Runtime { RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap()) }
+    pub fn store(url: &str) -> PyResult<(Box<dyn ObjectStore>, String)> {
+        let e = |e: object_store::Error| PyValueError::new_err(e.to_string());
+        if let Some(p) = url.strip_prefix("file://") {
+            let (dir, prefix) = p.rsplit_once('/').unwrap_or((p, ""));
+            return Ok((Box::new(object_store::local::LocalFileSystem::new_with_prefix(dir).map_err(e)?), prefix.to_string()));
+        }
+        let (bucket, prefix) = url.trim_start_matches("s3://").split_once('/').unwrap_or((url, ""));
+        Ok((Box::new(object_store::aws::AmazonS3Builder::from_env().with_bucket_name(bucket).build().map_err(e)?), prefix.to_string()))
+    }
 }
 
 #[pyfunction]
