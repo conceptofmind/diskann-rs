@@ -17,8 +17,6 @@ idx.search(query, k=10, beam_width=128)
 
 Vectors are `list[list[float]]` (`arr.tolist()` for numpy). `l2` returns squared distances.
 
-
-# Build
 ```py
 docker run --rm -v "$PWD":/io -w /io/python quay.io/pypa/manylinux_2_28_x86_64 bash -c \
   'curl -sSf https://sh.rustup.rs | sh -s -- -y -q && . ~/.cargo/env && pipx run maturin build --release --sdist --out dist'
