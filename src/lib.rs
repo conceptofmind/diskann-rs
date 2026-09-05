@@ -68,8 +68,10 @@ pub mod sq;
 pub mod formats;
 pub mod rabitq;
 mod quantized;
+mod spfresh;
 
 pub use quantized::{QuantizedDiskANN, QuantizedConfig};
+pub use spfresh::{SPFresh, SPFreshConfig, SPFreshStats};
 
 pub use incremental::{
     IncrementalDiskANN, IncrementalConfig, IncrementalStats,

@@ -2,7 +2,7 @@ use diskann::pq::PQConfig;
 use diskann::{
     formats, DiskANN, DiskAnnError, DiskAnnParams, DistCosine, DistDot, DistL2Sq, Filter,
     FilteredDiskANN, IncrementalConfig, IncrementalDiskANN, IncrementalQuantizedConfig,
-    QuantizedConfig, QuantizedDiskANN, QuantizerKind,
+    QuantizedConfig, QuantizedDiskANN, QuantizerKind, SPFresh, SPFreshConfig,
 };
 use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -10,7 +10,7 @@ use pyo3::types::PyBytes;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
-
+// Metric: "l2" = squared L2, "cosine" = 1 - cos, "dot" = 1 - a·b.
 enum Any<A, B, C> {
     L2(A),
     Cos(B),
@@ -38,6 +38,16 @@ fn err(e: DiskAnnError) -> PyErr {
 }
 fn params(max_degree: usize, build_beam_width: usize, alpha: f32) -> DiskAnnParams {
     DiskAnnParams { max_degree, build_beam_width, alpha }
+}
+fn qkind(quantizer: Option<&str>, pq_subspaces: usize) -> PyResult<Option<QuantizerKind>> {
+    Ok(match quantizer {
+        None => None,
+        Some("f16") => Some(QuantizerKind::F16),
+        Some("int8") => Some(QuantizerKind::Int8),
+        Some("pq") => Some(QuantizerKind::PQ(PQConfig { num_subspaces: pq_subspaces, ..Default::default() })),
+        Some("rabitq") => Some(QuantizerKind::RaBitQ),
+        Some(q) => return Err(PyValueError::new_err(format!("unknown quantizer: {q}"))),
+    })
 }
 
 #[pyclass(name = "Filter", from_py_object)]
@@ -123,14 +133,7 @@ impl PyIncremental {
     fn build(py: Python<'_>, vectors: Vec<Vec<f32>>, path: &str, metric: &str, labels: Option<Vec<Vec<u64>>>, quantizer: Option<&str>, rerank_size: usize, pq_subspaces: usize, delta_threshold: usize, tombstone_ratio: f32) -> PyResult<Self> {
         let cfg = IncrementalConfig { delta_threshold, tombstone_ratio_threshold: tombstone_ratio, ..Default::default() };
         let qc = IncrementalQuantizedConfig { rerank_size };
-        let qk = match quantizer {
-            None => None,
-            Some("f16") => Some(QuantizerKind::F16),
-            Some("int8") => Some(QuantizerKind::Int8),
-            Some("pq") => Some(QuantizerKind::PQ(PQConfig { num_subspaces: pq_subspaces, ..Default::default() })),
-            Some("rabitq") => Some(QuantizerKind::RaBitQ),
-            Some(q) => return Err(PyValueError::new_err(format!("unknown quantizer: {q}"))),
-        };
+        let qk = qkind(quantizer, pq_subspaces)?;
         py.detach(|| Ok(Self(mk!(metric, match (labels, qk) {
             (None, None) => IncrementalDiskANN::<T>::build_with_config(&vectors, path, cfg),
             (Some(l), None) => IncrementalDiskANN::<T>::build_with_labels(&vectors, &l, path, cfg),
@@ -297,6 +300,52 @@ impl PyQuantized {
     fn dim(&self) -> usize { d!(&self.0, i => i.dim()) }
 }
 
+#[pyclass(name = "SPFresh")]
+struct PySPFresh(any!(SPFresh));
+
+#[pymethods]
+impl PySPFresh {
+    #[staticmethod]
+    #[pyo3(signature = (vectors, path, metric="l2", quantizer=None, rerank_size=0, pq_subspaces=8, max_posting_size=128, min_posting_size=16, reassign_neighbors=16, probe_ratio=f32::INFINITY))]
+    fn build(py: Python<'_>, vectors: Vec<Vec<f32>>, path: &str, metric: &str, quantizer: Option<&str>, rerank_size: usize, pq_subspaces: usize, max_posting_size: usize, min_posting_size: usize, reassign_neighbors: usize, probe_ratio: f32) -> PyResult<Self> {
+        let cfg = SPFreshConfig { max_posting_size, min_posting_size, probe_ratio, rerank_size, reassign_neighbors, ..Default::default() };
+        let qk = qkind(quantizer, pq_subspaces)?;
+        py.detach(|| Ok(Self(mk!(metric, SPFresh::<T>::build(&vectors, path, cfg, qk).map_err(err)?))))
+    }
+    #[staticmethod]
+    #[pyo3(signature = (path, metric="l2"))]
+    fn open(path: &str, metric: &str) -> PyResult<Self> {
+        Ok(Self(mk!(metric, SPFresh::<T>::open(path).map_err(err)?)))
+    }
+    fn save(&self) -> PyResult<()> { d!(&self.0, i => i.save()).map_err(err) }
+    fn insert(&self, py: Python<'_>, vectors: Vec<Vec<f32>>) -> PyResult<Vec<u64>> {
+        py.detach(|| d!(&self.0, i => i.insert(&vectors)).map_err(err))
+    }
+    fn delete(&self, ids: Vec<u64>) { d!(&self.0, i => i.delete(&ids)) }
+    fn is_deleted(&self, id: u64) -> bool { d!(&self.0, i => i.is_deleted(id)) }
+    #[pyo3(signature = (query, k=10, n_probe=8))]
+    fn search(&self, query: Vec<f32>, k: usize, n_probe: usize) -> Vec<u64> {
+        d!(&self.0, i => i.search(&query, k, n_probe))
+    }
+    #[pyo3(signature = (query, k=10, n_probe=8))]
+    fn search_with_dists(&self, query: Vec<f32>, k: usize, n_probe: usize) -> Vec<(u64, f32)> {
+        d!(&self.0, i => i.search_with_dists(&query, k, n_probe))
+    }
+    #[pyo3(signature = (queries, k=10, n_probe=8))]
+    fn search_batch(&self, py: Python<'_>, queries: Vec<Vec<f32>>, k: usize, n_probe: usize) -> Vec<Vec<u64>> {
+        py.detach(|| d!(&self.0, i => i.search_batch(&queries, k, n_probe)))
+    }
+    fn get_vector(&self, id: u64) -> Option<Vec<f32>> { d!(&self.0, i => i.get_vector(id)) }
+    fn gc(&self, py: Python<'_>) -> PyResult<()> { py.detach(|| d!(&self.0, i => i.gc()).map_err(err)) }
+    fn compact(&self, py: Python<'_>) -> PyResult<()> { py.detach(|| d!(&self.0, i => i.compact()).map_err(err)) }
+    fn stats(&self) -> HashMap<&'static str, usize> {
+        let s = d!(&self.0, i => i.stats());
+        HashMap::from([("live", s.live), ("deleted", s.deleted), ("postings", s.postings), ("max_posting", s.max_posting)])
+    }
+    #[getter]
+    fn dim(&self) -> usize { d!(&self.0, i => i.dim()) }
+}
+
 #[pyfunction]
 fn read_fvecs(path: &str) -> PyResult<Vec<Vec<f32>>> { formats::read_fvecs(path).map_err(err) }
 #[pyfunction]
@@ -314,6 +363,7 @@ fn pydiskann(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIncremental>()?;
     m.add_class::<PyFiltered>()?;
     m.add_class::<PyQuantized>()?;
+    m.add_class::<PySPFresh>()?;
     m.add_class::<PyFilter>()?;
     m.add_function(wrap_pyfunction!(read_fvecs, m)?)?;
     m.add_function(wrap_pyfunction!(read_ivecs, m)?)?;
