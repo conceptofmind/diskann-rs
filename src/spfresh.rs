@@ -8,6 +8,8 @@ use memmap2::MmapMut;
 use rand::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use numkong::Euclidean;
+use std::any::TypeId;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -319,18 +321,29 @@ where
         blk[..4].copy_from_slice(&((n + 1) as u32).to_le_bytes());
     }
 
-    fn encode(&self, v: &[f32]) -> Vec<u8> {
+    /// Code for `v` stored in posting `b`. RaBitQ codes are residuals against the
+    /// posting centroid, so entries must be re-encoded whenever they change posting.
+    fn encode(&self, v: &[f32], b: u32) -> Vec<u8> {
         match &self.quantizer {
             None => bytemuck::cast_slice(v).to_vec(),
             Some(QuantizerState::PQ(q)) => q.encode(v),
             Some(QuantizerState::F16(q)) => q.encode(v),
             Some(QuantizerState::Int8(q)) => q.encode(v),
-            Some(QuantizerState::RaBitQ(q)) => q.encode(v),
+            Some(QuantizerState::RaBitQ(q)) => q.encode_with(v, &self.block_centroid[b as usize]),
         }
     }
+    fn encode_id(&self, id: u64, b: u32) -> Vec<u8> {
+        self.encode(self.raw(id), b)
+    }
+    fn residual(&self) -> bool {
+        matches!(self.quantizer, Some(QuantizerState::RaBitQ(_)))
+    }
 
-    fn code_dist(&self, query: &[f32], code: &[u8], prep: &Option<Prepared>) -> f32 {
+    fn code_dist(&self, query: &[f32], code: &[u8], prep: &Option<Prepared>, b: u32) -> f32 {
         match (&self.quantizer, prep) {
+            (Some(QuantizerState::RaBitQ(q)), _) => self
+                .dist
+                .eval(query, &q.decode_with(code, &self.block_centroid[b as usize])),
             (Some(q), Some(p)) => {
                 quantized_distance_from_codes(&self.dist, query, 0, code, self.code_size, q, p)
             }
@@ -430,7 +443,7 @@ where
                     Some((b, _)) => b,
                     None => self.new_posting(v.clone())?,
                 };
-                let code = self.encode(v);
+                let code = self.encode(v, b);
                 self.push(b, id, &code);
                 if self.len(b) >= self.cfg.max_posting_size {
                     queue.push(b);
@@ -496,6 +509,7 @@ where
                 }
                 from
             };
+            let code = if self.residual() { self.encode_id(id, t) } else { code };
             self.push(t, id, &code);
             if self.len(t) >= self.cfg.max_posting_size {
                 queue.push(t);
@@ -515,7 +529,15 @@ where
         self.free_posting(b)?;
         let nb = [self.new_posting(c1)?, self.new_posting(c2)?];
         for ((id, code), &s) in entries.iter().zip(&side) {
-            self.push(nb[s as usize], *id, code);
+            let t = nb[s as usize];
+            let owned;
+            let code: &[u8] = if self.residual() {
+                owned = self.encode_id(*id, t);
+                &owned
+            } else {
+                code
+            };
+            self.push(t, *id, code);
         }
         // NPA for the split vectors: move to a closer centroid elsewhere.
         for &p in &nb {
@@ -580,6 +602,7 @@ where
                         .first()
                         .map(|t| t.0)
                         .unwrap_or_else(|| *self.cid_block.values().next().unwrap());
+                    let code = if self.residual() { self.encode_id(id, t) } else { code };
                     self.push(t, id, &code);
                     if self.len(t) >= self.cfg.max_posting_size {
                         queue.push(t);
@@ -635,6 +658,18 @@ where
         let Some(&(_, d0)) = probes.first() else {
             return Vec::new();
         };
+        let ratio = self.cfg.probe_ratio;
+        let probes = probes
+            .into_iter()
+            .take_while(move |&(_, d)| !(ratio.is_finite() && d0 >= 0.0 && d > d0 * ratio.max(1.0)))
+            .map(|(b, _)| b);
+        let l2 = TypeId::of::<D>() == TypeId::of::<crate::DistL2>();
+        if let (Some(QuantizerState::RaBitQ(rq)), true) = (
+            &self.quantizer,
+            l2 || TypeId::of::<D>() == TypeId::of::<crate::DistL2Sq>(),
+        ) {
+            return self.search_rabitq(rq, query, k, probes, l2);
+        }
         let prep = self.quantizer.as_ref().map(|q| q.prepare(query));
         let rerank = self.quantizer.is_some() && self.cfg.rerank_size > 0;
         let want = if rerank {
@@ -643,19 +678,13 @@ where
             k
         };
         let mut heap = BinaryHeap::new();
-        for (b, d) in probes {
-            if self.cfg.probe_ratio.is_finite()
-                && d0 >= 0.0
-                && d > d0 * self.cfg.probe_ratio.max(1.0)
-            {
-                break;
-            }
+        for b in probes {
             for i in 0..self.len(b) {
                 let (id, code) = self.entry(b, i);
                 if self.deleted.contains(&id) {
                     continue;
                 }
-                let dist = self.code_dist(query, code, &prep);
+                let dist = self.code_dist(query, code, &prep, b);
                 if heap.len() < want {
                     heap.push(Cand(dist, id));
                 } else if dist < heap.peek().unwrap().0 {
@@ -670,8 +699,51 @@ where
                 r.1 = self.dist.eval(query, self.raw(r.0));
             }
         }
-        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        out.sort_by(|a, b| a.1.total_cmp(&b.1));
         out.truncate(k);
+        out
+    }
+
+    /// RaBitQ scan with error-bound reranking (paper Alg. 2): a candidate gets an
+    /// exact distance only if its lower bound beats the current k-th exact distance.
+    fn search_rabitq(
+        &self,
+        rq: &RaBitQ,
+        query: &[f32],
+        k: usize,
+        probes: impl Iterator<Item = u32>,
+        sqrt: bool,
+    ) -> Vec<(u64, f32)> {
+        let mut heap: BinaryHeap<Cand> = BinaryHeap::new();
+        for b in probes {
+            let qb = rq.query_with(query, &self.block_centroid[b as usize]);
+            for i in 0..self.len(b) {
+                let (id, code) = self.entry(b, i);
+                if self.deleted.contains(&id) {
+                    continue;
+                }
+                let (est, err) = rq.distance_with_bound(&qb, code);
+                let kth = if heap.len() < k {
+                    f32::INFINITY
+                } else {
+                    heap.peek().unwrap().0
+                };
+                if est - err < kth {
+                    let exact = f32::sqeuclidean(query, self.raw(id)).unwrap() as f32;
+                    if heap.len() < k {
+                        heap.push(Cand(exact, id));
+                    } else if exact < kth {
+                        heap.pop();
+                        heap.push(Cand(exact, id));
+                    }
+                }
+            }
+        }
+        let mut out: Vec<(u64, f32)> = heap
+            .into_iter()
+            .map(|c| (c.1, if sqrt { c.0.sqrt() } else { c.0 }))
+            .collect();
+        out.sort_by(|a, b| a.1.total_cmp(&b.1));
         out
     }
 }

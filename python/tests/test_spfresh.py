@@ -204,7 +204,7 @@ def test_compact_preserves_results(built) -> None:
 
 @pytest.mark.parametrize(
     "quantizer,min_recall",
-    [("f16", 0.98), ("int8", 0.9), ("rabitq", 0.8), ("pq", 0.5)],
+    [("f16", 0.98), ("int8", 0.9), ("rabitq", 0.95), ("pq", 0.5)],
 )
 def test_quantizers_rerank_exact(tmp_path: Path, quantizer: str, min_recall: float) -> None:
     vs = clustered(2000, seed=14)

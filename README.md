@@ -7,6 +7,8 @@ Tests:
 cargo clean &&
 CC=gcc-12 cargo build --release &&
 CC=gcc-12 cargo test --release
+
+CC=gcc-12 cargo bench --bench spfresh
 ```
 ```
 CC=gcc-12 uv run pytest tests/tests.py

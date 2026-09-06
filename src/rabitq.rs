@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 const ROUNDS: usize = 3;
 const QBITS: u32 = 4;
+/// Error-bound constant from the RaBitQ paper (ε₀).
+const EPS0: f32 = 1.9;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RaBitQ {
@@ -130,13 +132,13 @@ impl RaBitQ {
         }
     }
 
-    /// Center, normalize, pad, rotate. Returns (o', ‖v - c‖).
-    fn prep(&self, v: &[f32]) -> (Vec<f32>, f32) {
+    /// Center on `centroid`, normalize, pad, rotate. Returns (o', ‖v - centroid‖).
+    fn prep_with(&self, v: &[f32], centroid: &[f32]) -> (Vec<f32>, f32) {
         assert_eq!(v.len(), self.dim, "Vector dimension mismatch");
         let mut r = vec![0.0f32; self.padded];
         r.iter_mut()
             .zip(v)
-            .zip(&self.centroid)
+            .zip(centroid)
             .for_each(|((r, x), c)| *r = x - c);
         let norm = r.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
@@ -148,7 +150,12 @@ impl RaBitQ {
 
     /// Per-query precomputation (do once, then `distance` per candidate).
     pub fn query(&self, q: &[f32]) -> RaBitQQuery {
-        let (r, nq) = self.prep(q);
+        self.query_with(q, &self.centroid)
+    }
+
+    /// Like [`query`](Self::query) but centered on `centroid` (residual codes, see [`encode_with`](Self::encode_with)).
+    pub fn query_with(&self, q: &[f32], centroid: &[f32]) -> RaBitQQuery {
+        let (r, nq) = self.prep_with(q, centroid);
         let (lo, hi) = r
             .iter()
             .fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
@@ -188,11 +195,49 @@ impl RaBitQ {
         let fac = f32::from_le_bytes(code[w + 4..w + 8].try_into().unwrap());
         (n2 + q.nq2 - q.s * fac * (q.k1 * s as f32 + q.k2 * c as f32 + q.k3)).max(0.0)
     }
-}
 
-impl VectorQuantizer for RaBitQ {
-    fn encode(&self, vector: &[f32]) -> Vec<u8> {
-        let (r, norm) = self.prep(vector);
+    /// Estimated squared L2 distance plus its high-probability error radius
+    /// (RaBitQ Thm 3.2 with ε₀ = 1.9): the true distance is ≥ `est - err` w.h.p.
+    #[inline]
+    pub fn distance_with_bound(&self, q: &RaBitQQuery, code: &[u8]) -> (f32, f32) {
+        let w = 8 * q.words;
+        let (s, c) = ip_bits_dispatch(&code[..w], &q.planes);
+        let n2 = f32::from_le_bytes(code[w..w + 4].try_into().unwrap());
+        let fac = f32::from_le_bytes(code[w + 4..w + 8].try_into().unwrap());
+        let est = (n2 + q.nq2 - q.s * fac * (q.k1 * s as f32 + q.k2 * c as f32 + q.k3)).max(0.0);
+        let ip = if fac > 0.0 { n2.sqrt() / fac } else { 0.0 };
+        let err = if ip > 0.0 {
+            q.s * fac * EPS0 * ((1.0 - ip * ip).max(0.0) / (self.padded as f32 - 1.0)).sqrt()
+        } else {
+            f32::INFINITY
+        };
+        (est, err)
+    }
+
+    /// Encode `v - centroid` (residual quantization for IVF/SPFresh postings).
+    pub fn encode_with(&self, v: &[f32], centroid: &[f32]) -> Vec<u8> {
+        let (r, norm) = self.prep_with(v, centroid);
+        self.pack(&r, norm)
+    }
+
+    /// Decode a code produced by [`encode_with`](Self::encode_with) with the same `centroid`.
+    pub fn decode_with(&self, codes: &[u8], centroid: &[f32]) -> Vec<f32> {
+        assert_eq!(codes.len(), self.code_size(), "Code length mismatch");
+        let w = self.padded / 8;
+        let sd = (self.padded as f32).sqrt();
+        let mut r: Vec<f32> = codes[..w]
+            .chunks_exact(8)
+            .flat_map(|ch| {
+                let b = u64::from_le_bytes(ch.try_into().unwrap());
+                (0..64).map(move |i| if (b >> i) & 1 == 1 { 1.0 / sd } else { -1.0 / sd })
+            })
+            .collect();
+        self.unrotate(&mut r);
+        let norm = f32::from_le_bytes(codes[w..w + 4].try_into().unwrap()).sqrt();
+        r.iter().zip(centroid).map(|(x, c)| c + norm * x).collect()
+    }
+
+    fn pack(&self, r: &[f32], norm: f32) -> Vec<u8> {
         let mut code = Vec::with_capacity(self.code_size());
         let mut ip = 0.0f32;
         for chunk in r.chunks_exact(64) {
@@ -209,30 +254,15 @@ impl VectorQuantizer for RaBitQ {
         code.extend_from_slice(&fac.to_le_bytes());
         code
     }
+}
+
+impl VectorQuantizer for RaBitQ {
+    fn encode(&self, vector: &[f32]) -> Vec<u8> {
+        self.encode_with(vector, &self.centroid)
+    }
 
     fn decode(&self, codes: &[u8]) -> Vec<f32> {
-        assert_eq!(codes.len(), self.code_size(), "Code length mismatch");
-        let w = self.padded / 8;
-        let sd = (self.padded as f32).sqrt();
-        let mut r: Vec<f32> = codes[..w]
-            .chunks_exact(8)
-            .flat_map(|ch| {
-                let b = u64::from_le_bytes(ch.try_into().unwrap());
-                (0..64).map(move |i| {
-                    if (b >> i) & 1 == 1 {
-                        1.0 / sd
-                    } else {
-                        -1.0 / sd
-                    }
-                })
-            })
-            .collect();
-        self.unrotate(&mut r);
-        let norm = f32::from_le_bytes(codes[w..w + 4].try_into().unwrap()).sqrt();
-        r.iter()
-            .zip(&self.centroid)
-            .map(|(x, c)| c + norm * x)
-            .collect()
+        self.decode_with(codes, &self.centroid)
     }
 
     fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 {
