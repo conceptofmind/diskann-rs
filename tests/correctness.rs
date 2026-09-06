@@ -11,9 +11,9 @@
 use diskann_rs::pq::{PQConfig, ProductQuantizer};
 use diskann_rs::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
 use diskann_rs::{
-    DiskANN, DiskAnnParams, DistCosine, DistL2, Filter, FilteredDiskANN, IncrementalDiskANN,
-    IncrementalConfig, IncrementalQuantizedConfig, QuantizerKind,
-    QuantizedConfig, QuantizedDiskANN,
+    DiskANN, DiskAnnParams, DistCosine, DistL2, Filter, FilteredDiskANN, IncrementalConfig,
+    IncrementalDiskANN, IncrementalQuantizedConfig, QuantizedConfig, QuantizedDiskANN,
+    QuantizerKind,
 };
 use rand::prelude::*;
 use rand::SeedableRng;
@@ -76,13 +76,13 @@ fn assert_search_invariants(results: &[(u32, f32)], k: usize, num_vectors: usize
 
     // Distances are non-negative
     for (id, dist) in results {
+        assert!(*dist >= 0.0, "Negative distance for id {}: {}", id, dist);
         assert!(
-            *dist >= 0.0,
-            "Negative distance for id {}: {}",
+            dist.is_finite(),
+            "Non-finite distance for id {}: {}",
             id,
             dist
         );
-        assert!(dist.is_finite(), "Non-finite distance for id {}: {}", id, dist);
     }
 
     // Distances are non-decreasing
@@ -244,10 +244,7 @@ fn test_search_invariants_quantized_reranked() {
 #[test]
 fn test_search_invariants_filtered() {
     let path = "test_invariants_filtered";
-    cleanup(&[
-        &format!("{}.idx", path),
-        &format!("{}.labels", path),
-    ]);
+    cleanup(&[&format!("{}.idx", path), &format!("{}.labels", path)]);
 
     let vectors = random_vectors(200, 32, 105);
     let labels: Vec<Vec<u64>> = (0..200).map(|i| vec![i as u64 % 5]).collect();
@@ -257,12 +254,13 @@ fn test_search_invariants_filtered() {
     let results = index.search_filtered(query, 10, 64, &Filter::None);
     assert_eq!(results.len(), 10);
     let ids: HashSet<u32> = results.iter().copied().collect();
-    assert_eq!(ids.len(), results.len(), "Duplicate IDs in filtered results");
+    assert_eq!(
+        ids.len(),
+        results.len(),
+        "Duplicate IDs in filtered results"
+    );
 
-    cleanup(&[
-        &format!("{}.idx", path),
-        &format!("{}.labels", path),
-    ]);
+    cleanup(&[&format!("{}.idx", path), &format!("{}.labels", path)]);
 }
 
 #[test]
@@ -485,10 +483,7 @@ fn test_pq_num_centroids_exceeds_256() {
         training_sample_size: 0,
     };
     let result = ProductQuantizer::train(&vectors, config);
-    assert!(
-        result.is_err(),
-        "num_centroids > 256 should be rejected"
-    );
+    assert!(result.is_err(), "num_centroids > 256 should be rejected");
 }
 
 #[test]
@@ -501,10 +496,7 @@ fn test_pq_dim_not_divisible_by_subspaces() {
         training_sample_size: 0,
     };
     let result = ProductQuantizer::train(&vectors, config);
-    assert!(
-        result.is_err(),
-        "Dimension 65 not divisible by 8 subspaces"
-    );
+    assert!(result.is_err(), "Dimension 65 not divisible by 8 subspaces");
 }
 
 #[test]
@@ -677,9 +669,13 @@ fn test_corrupted_sidecar_file() {
     cleanup(&[base_path, sidecar_path]);
 
     let vectors = random_vectors(50, 32, 500);
-    let _base =
-        DiskANN::<DistL2>::build_index_with_params(&vectors, DistL2 {}, base_path, default_ann_params())
-            .unwrap();
+    let _base = DiskANN::<DistL2>::build_index_with_params(
+        &vectors,
+        DistL2 {},
+        base_path,
+        default_ann_params(),
+    )
+    .unwrap();
 
     // Write garbage sidecar
     std::fs::write(sidecar_path, b"not a valid sidecar file").unwrap();
@@ -794,13 +790,9 @@ fn test_recall_quantized_f16_vs_exact() {
     let vectors = random_vectors(500, dim, 604);
     let ann_params = default_ann_params();
 
-    let exact_index = DiskANN::<DistL2>::build_index_with_params(
-        &vectors,
-        DistL2 {},
-        path_exact,
-        ann_params,
-    )
-    .unwrap();
+    let exact_index =
+        DiskANN::<DistL2>::build_index_with_params(&vectors, DistL2 {}, path_exact, ann_params)
+            .unwrap();
 
     let quant_index = QuantizedDiskANN::<DistL2>::build_f16(
         &vectors,
@@ -841,13 +833,9 @@ fn test_recall_quantized_int8_vs_exact() {
     let vectors = random_vectors(500, dim, 606);
     let ann_params = default_ann_params();
 
-    let exact_index = DiskANN::<DistL2>::build_index_with_params(
-        &vectors,
-        DistL2 {},
-        path_exact,
-        ann_params,
-    )
-    .unwrap();
+    let exact_index =
+        DiskANN::<DistL2>::build_index_with_params(&vectors, DistL2 {}, path_exact, ann_params)
+            .unwrap();
 
     let quant_index = QuantizedDiskANN::<DistL2>::build_int8(
         &vectors,
@@ -940,10 +928,7 @@ fn test_recall_reranking_strictly_helps() {
 #[test]
 fn test_filtered_no_matches() {
     let path = "test_filtered_no_match";
-    cleanup(&[
-        &format!("{}.idx", path),
-        &format!("{}.labels", path),
-    ]);
+    cleanup(&[&format!("{}.idx", path), &format!("{}.labels", path)]);
 
     let vectors = random_vectors(100, 16, 700);
     let labels: Vec<Vec<u64>> = (0..100).map(|_| vec![0]).collect();
@@ -953,19 +938,13 @@ fn test_filtered_no_matches() {
     let results = index.search_filtered(&vectors[0], 10, 64, &Filter::label_eq(0, 999));
     assert_eq!(results.len(), 0, "No vectors match label 999");
 
-    cleanup(&[
-        &format!("{}.idx", path),
-        &format!("{}.labels", path),
-    ]);
+    cleanup(&[&format!("{}.idx", path), &format!("{}.labels", path)]);
 }
 
 #[test]
 fn test_filtered_all_match() {
     let path = "test_filtered_all_match";
-    cleanup(&[
-        &format!("{}.idx", path),
-        &format!("{}.labels", path),
-    ]);
+    cleanup(&[&format!("{}.idx", path), &format!("{}.labels", path)]);
 
     let vectors = random_vectors(100, 16, 701);
     let labels: Vec<Vec<u64>> = (0..100).map(|_| vec![1]).collect();
@@ -988,10 +967,7 @@ fn test_filtered_all_match() {
         overlap
     );
 
-    cleanup(&[
-        &format!("{}.idx", path),
-        &format!("{}.labels", path),
-    ]);
+    cleanup(&[&format!("{}.idx", path), &format!("{}.labels", path)]);
 }
 
 // =========================================================================
@@ -1116,12 +1092,16 @@ fn test_quantized_persistence_preserves_codes() {
 
     // Save and reload
     index.save_quantized(sidecar_path).unwrap();
-    let loaded = QuantizedDiskANN::<DistL2>::open(base_path, sidecar_path, DistL2 {}, config).unwrap();
+    let loaded =
+        QuantizedDiskANN::<DistL2>::open(base_path, sidecar_path, DistL2 {}, config).unwrap();
 
     // Same queries after reload
     let results_after: Vec<Vec<u32>> = queries.iter().map(|q| loaded.search(q, 5, 32)).collect();
 
-    assert_eq!(results_before, results_after, "Results changed after save/load");
+    assert_eq!(
+        results_before, results_after,
+        "Results changed after save/load"
+    );
 
     cleanup(&[base_path, sidecar_path]);
 }
@@ -1144,15 +1124,21 @@ fn test_to_bytes_from_bytes_preserves_all_quantizers() {
                     kmeans_iterations: 10,
                     training_sample_size: 0,
                 };
-                QuantizedDiskANN::build_pq(&vectors, DistL2 {}, &path, ann_params, pq_config, config)
-                    .unwrap()
+                QuantizedDiskANN::build_pq(
+                    &vectors,
+                    DistL2 {},
+                    &path,
+                    ann_params,
+                    pq_config,
+                    config,
+                )
+                .unwrap()
             }
             "f16" => {
                 QuantizedDiskANN::build_f16(&vectors, DistL2 {}, &path, ann_params, config).unwrap()
             }
-            "int8" => {
-                QuantizedDiskANN::build_int8(&vectors, DistL2 {}, &path, ann_params, config).unwrap()
-            }
+            "int8" => QuantizedDiskANN::build_int8(&vectors, DistL2 {}, &path, ann_params, config)
+                .unwrap(),
             _ => unreachable!(),
         };
 
@@ -1215,12 +1201,7 @@ fn test_int8_negative_values() {
         let codes = q.encode(v);
         let decoded = q.decode(&codes);
         for (orig, dec) in v.iter().zip(&decoded) {
-            assert!(
-                (orig - dec).abs() < 0.2,
-                "orig={}, dec={}",
-                orig,
-                dec
-            );
+            assert!((orig - dec).abs() < 0.2, "orig={}, dec={}", orig, dec);
         }
     }
 }
@@ -1280,13 +1261,9 @@ fn test_new_format_round_trip() {
     cleanup(&[path]);
 
     let vectors = random_vectors(50, 16, 1200);
-    let index = DiskANN::<DistL2>::build_index_with_params(
-        &vectors,
-        DistL2 {},
-        path,
-        default_ann_params(),
-    )
-    .unwrap();
+    let index =
+        DiskANN::<DistL2>::build_index_with_params(&vectors, DistL2 {}, path, default_ann_params())
+            .unwrap();
 
     let query = &vectors[0];
     let res_before = index.search(query, 5, 32);
@@ -1344,7 +1321,10 @@ fn test_quantized_filtered_search_basic() {
     }
 
     // Should find at least some results
-    assert!(!results.is_empty(), "Should find at least one matching result");
+    assert!(
+        !results.is_empty(),
+        "Should find at least one matching result"
+    );
 
     cleanup(&[path]);
 }
@@ -1388,7 +1368,9 @@ fn test_quantized_filtered_search_with_reranking() {
         assert!(
             (dist - exact).abs() < 1e-4,
             "Distance mismatch for id {}: returned {}, exact {}",
-            id, dist, exact
+            id,
+            dist,
+            exact
         );
     }
 
@@ -1509,7 +1491,9 @@ fn test_incremental_filtered_add_with_labels() {
     // Add vectors with label category 9 (unique, easy to test)
     let new_vecs = random_vectors(10, 32, 1402);
     let new_labels: Vec<Vec<u64>> = (0..10).map(|_| vec![9]).collect();
-    let new_ids = index.add_vectors_with_labels(&new_vecs, &new_labels).unwrap();
+    let new_ids = index
+        .add_vectors_with_labels(&new_vecs, &new_labels)
+        .unwrap();
     assert_eq!(new_ids.len(), 10);
 
     // Search for category 9 — should find the delta vectors
@@ -1571,7 +1555,9 @@ fn test_incremental_filtered_compact() {
     // Add some labeled vectors
     let new_vecs = random_vectors(10, 32, 1405);
     let new_labels: Vec<Vec<u64>> = (0..10).map(|_| vec![7]).collect();
-    index.add_vectors_with_labels(&new_vecs, &new_labels).unwrap();
+    index
+        .add_vectors_with_labels(&new_vecs, &new_labels)
+        .unwrap();
 
     // Delete some base vectors
     index.delete_vectors(&[0, 1]).unwrap();
@@ -1587,7 +1573,10 @@ fn test_incremental_filtered_compact() {
     // Labels should survive compaction — search for category 7
     let filter = Filter::label_eq(0, 7);
     let results = index.search_filtered(&new_vecs[0], 5, 64, &filter);
-    assert!(!results.is_empty(), "Category 7 vectors should survive compaction");
+    assert!(
+        !results.is_empty(),
+        "Category 7 vectors should survive compaction"
+    );
 
     cleanup(&[path1, path2]);
 }
@@ -1758,7 +1747,9 @@ fn test_incremental_full_combo() {
     // Add labeled vectors
     let new_vecs = random_vectors(10, dim, 1601);
     let new_labels: Vec<Vec<u64>> = (0..10).map(|_| vec![8]).collect();
-    index.add_vectors_with_labels(&new_vecs, &new_labels).unwrap();
+    index
+        .add_vectors_with_labels(&new_vecs, &new_labels)
+        .unwrap();
 
     // Delete some base vectors
     index.delete_vectors(&[0, 1, 2]).unwrap();
@@ -1773,7 +1764,10 @@ fn test_incremental_full_combo() {
     // Filtered search: category 8 (delta only)
     let filter = Filter::label_eq(0, 8);
     let filtered_results = index.search_filtered(&new_vecs[0], 5, 64, &filter);
-    assert!(!filtered_results.is_empty(), "Should find category 8 delta vectors");
+    assert!(
+        !filtered_results.is_empty(),
+        "Should find category 8 delta vectors"
+    );
 
     // Filtered search: category 3 (base only)
     let filter3 = Filter::label_eq(0, 3);
@@ -1810,17 +1804,16 @@ fn test_incremental_filtered_bytes_roundtrip() {
     // Add some labeled delta vectors
     let new_vecs = random_vectors(5, 32, 1701);
     let new_labels: Vec<Vec<u64>> = (0..5).map(|_| vec![9]).collect();
-    index.add_vectors_with_labels(&new_vecs, &new_labels).unwrap();
+    index
+        .add_vectors_with_labels(&new_vecs, &new_labels)
+        .unwrap();
     index.delete_vectors(&[0]).unwrap();
 
     let bytes = index.to_bytes();
 
-    let loaded = IncrementalDiskANN::<DistL2>::from_bytes(
-        &bytes,
-        DistL2 {},
-        IncrementalConfig::default(),
-    )
-    .unwrap();
+    let loaded =
+        IncrementalDiskANN::<DistL2>::from_bytes(&bytes, DistL2 {}, IncrementalConfig::default())
+            .unwrap();
 
     assert!(loaded.has_labels());
     let stats = loaded.stats();
@@ -1831,7 +1824,10 @@ fn test_incremental_filtered_bytes_roundtrip() {
     // Filtered search should still work after roundtrip
     let filter = Filter::label_eq(0, 9);
     let results = loaded.search_filtered(&new_vecs[0], 3, 64, &filter);
-    assert!(!results.is_empty(), "Should find category 9 after roundtrip");
+    assert!(
+        !results.is_empty(),
+        "Should find category 9 after roundtrip"
+    );
 
     cleanup(&[path]);
 }
@@ -1857,18 +1853,18 @@ fn test_incremental_quantized_bytes_roundtrip() {
     let res_before = index.search(query, 5, 64);
 
     let bytes = index.to_bytes();
-    let loaded = IncrementalDiskANN::<DistL2>::from_bytes(
-        &bytes,
-        DistL2 {},
-        IncrementalConfig::default(),
-    )
-    .unwrap();
+    let loaded =
+        IncrementalDiskANN::<DistL2>::from_bytes(&bytes, DistL2 {}, IncrementalConfig::default())
+            .unwrap();
 
     assert!(loaded.has_quantizer());
     let res_after = loaded.search(query, 5, 64);
 
     // Results should be the same after roundtrip
-    assert_eq!(res_before, res_after, "Results changed after bytes roundtrip");
+    assert_eq!(
+        res_before, res_after,
+        "Results changed after bytes roundtrip"
+    );
 
     cleanup(&[path]);
 }
@@ -1881,13 +1877,9 @@ fn test_incremental_backward_compat_bytes() {
     let vectors = random_vectors(30, 16, 1704);
 
     // Build old-format bytes: [has_base:u8][base_len:u64][base_bytes][dim:u64]...
-    let base = DiskANN::<DistL2>::build_index_with_params(
-        &vectors,
-        DistL2 {},
-        path,
-        default_ann_params(),
-    )
-    .unwrap();
+    let base =
+        DiskANN::<DistL2>::build_index_with_params(&vectors, DistL2 {}, path, default_ann_params())
+            .unwrap();
     let base_bytes = base.to_bytes();
 
     let mut old_bytes = Vec::new();

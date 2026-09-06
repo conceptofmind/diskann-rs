@@ -59,38 +59,37 @@
 //!
 //! `vectors_offset` is a fixed 1 MiB gap by default.
 
-mod incremental;
 mod filtered;
+pub mod formats;
+mod incremental;
 mod metric;
 pub mod pq;
-pub mod storage;
-pub mod sq;
-pub mod formats;
-pub mod rabitq;
 mod quantized;
+pub mod rabitq;
 mod spfresh;
+pub mod sq;
+pub mod storage;
 
-pub use quantized::{QuantizedDiskANN, QuantizedConfig};
+pub use quantized::{QuantizedConfig, QuantizedDiskANN};
 pub use spfresh::{Manifest, SPFresh, SPFreshConfig, SPFreshStats, RAW_CHUNK};
 
 pub use incremental::{
-    IncrementalDiskANN, IncrementalConfig, IncrementalStats,
-    IncrementalQuantizedConfig, QuantizerKind,
-    is_delta_id, delta_local_idx,
+    delta_local_idx, is_delta_id, IncrementalConfig, IncrementalDiskANN,
+    IncrementalQuantizedConfig, IncrementalStats, QuantizerKind,
 };
 
-pub use filtered::{FilteredDiskANN, Filter};
+pub use filtered::{Filter, FilteredDiskANN};
 
-pub use pq::{ProductQuantizer, PQConfig, PQStats};
+pub use pq::{PQConfig, PQStats, ProductQuantizer};
 
 pub use storage::Storage;
 
-pub use sq::{VectorQuantizer, F16Quantizer, Int8Quantizer};
+pub use sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
 
 pub use rabitq::{RaBitQ, RaBitQQuery};
 
-pub use metric::{simd_info, DistCosine, DistDot, DistL2, DistL2Sq, Distance};
 use bytemuck;
+pub use metric::{simd_info, DistCosine, DistDot, DistL2, DistL2Sq, Distance};
 use rand::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -590,7 +589,8 @@ where
             let version = u32::from_le_bytes(ver_buf);
             if version != CORE_FORMAT_VERSION {
                 return Err(DiskAnnError::IndexError(format!(
-                    "Unsupported core format version: {}", version
+                    "Unsupported core format version: {}",
+                    version
                 )));
             }
             8u64 // magic + version = 8 bytes, then md_len starts
@@ -704,7 +704,9 @@ where
     /// Handles both new format (with magic/version) and old format (raw md_len).
     fn parse_metadata(bytes: &[u8]) -> Result<Metadata, DiskAnnError> {
         if bytes.len() < 8 {
-            return Err(DiskAnnError::IndexError("Buffer too small for metadata length".into()));
+            return Err(DiskAnnError::IndexError(
+                "Buffer too small for metadata length".into(),
+            ));
         }
 
         // Detect format: check first 4 bytes for magic
@@ -712,12 +714,15 @@ where
         let md_offset = if first_u32 == CORE_MAGIC {
             // New format: skip magic(4) + version(4)
             if bytes.len() < 16 {
-                return Err(DiskAnnError::IndexError("Buffer too small for header".into()));
+                return Err(DiskAnnError::IndexError(
+                    "Buffer too small for header".into(),
+                ));
             }
             let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
             if version != CORE_FORMAT_VERSION {
                 return Err(DiskAnnError::IndexError(format!(
-                    "Unsupported core format version: {}", version
+                    "Unsupported core format version: {}",
+                    version
                 )));
             }
             8
@@ -726,13 +731,19 @@ where
         };
 
         if bytes.len() < md_offset + 8 {
-            return Err(DiskAnnError::IndexError("Buffer too small for metadata length".into()));
+            return Err(DiskAnnError::IndexError(
+                "Buffer too small for metadata length".into(),
+            ));
         }
-        let md_len = u64::from_le_bytes(bytes[md_offset..md_offset + 8].try_into().unwrap()) as usize;
+        let md_len =
+            u64::from_le_bytes(bytes[md_offset..md_offset + 8].try_into().unwrap()) as usize;
         if bytes.len() < md_offset + 8 + md_len {
-            return Err(DiskAnnError::IndexError("Buffer too small for metadata".into()));
+            return Err(DiskAnnError::IndexError(
+                "Buffer too small for metadata".into(),
+            ));
         }
-        let metadata: Metadata = bincode::deserialize(&bytes[md_offset + 8..md_offset + 8 + md_len])?;
+        let metadata: Metadata =
+            bincode::deserialize(&bytes[md_offset + 8..md_offset + 8 + md_len])?;
         Ok(metadata)
     }
 
@@ -752,7 +763,13 @@ where
             beam_width,
             k,
             |id| self.distance_to(query, id as usize),
-            |id| self.get_neighbors(id).iter().copied().filter(|&nb| nb != PAD_U32).collect(),
+            |id| {
+                self.get_neighbors(id)
+                    .iter()
+                    .copied()
+                    .filter(|&nb| nb != PAD_U32)
+                    .collect()
+            },
             |_| true,
             BeamSearchConfig::default(),
         )
@@ -1388,11 +1405,11 @@ mod tests {
         ];
 
         let neighbors: Vec<Vec<u32>> = vec![
-            vec![1, 3],    // 0 -> 1, 3
-            vec![0, 2],    // 1 -> 0, 2
-            vec![1, 4],    // 2 -> 1, 4
-            vec![0, 4],    // 3 -> 0, 4
-            vec![2, 3],    // 4 -> 2, 3
+            vec![1, 3], // 0 -> 1, 3
+            vec![0, 2], // 1 -> 0, 2
+            vec![1, 4], // 2 -> 1, 4
+            vec![0, 4], // 3 -> 0, 4
+            vec![2, 3], // 4 -> 2, 3
         ];
 
         // Query near node 4: (2.1, 0.9)
@@ -1424,12 +1441,10 @@ mod tests {
     #[test]
     fn test_beam_search_with_filter() {
         // Same 5-node graph as above
-        let positions: Vec<[f32; 2]> = vec![
-            [0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 1.0],
-        ];
-        let neighbors: Vec<Vec<u32>> = vec![
-            vec![1, 3], vec![0, 2], vec![1, 4], vec![0, 4], vec![2, 3],
-        ];
+        let positions: Vec<[f32; 2]> =
+            vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 1.0]];
+        let neighbors: Vec<Vec<u32>> =
+            vec![vec![1, 3], vec![0, 2], vec![1, 4], vec![0, 4], vec![2, 3]];
 
         // Query near node 4, but filter out nodes 4 and 2 (even IDs only allowed: 0, 2, 4... but let's filter for odd IDs)
         let query = [2.1f32, 0.9];
@@ -1532,7 +1547,11 @@ mod tests {
 
         // First 4 bytes should be CORE_MAGIC
         let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        assert_eq!(magic, CORE_MAGIC, "Expected magic 0x{:08X}, got 0x{:08X}", CORE_MAGIC, magic);
+        assert_eq!(
+            magic, CORE_MAGIC,
+            "Expected magic 0x{:08X}, got 0x{:08X}",
+            CORE_MAGIC, magic
+        );
 
         // Next 4 bytes should be version
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());

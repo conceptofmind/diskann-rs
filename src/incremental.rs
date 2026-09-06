@@ -54,15 +54,17 @@
 //! ```
 
 use crate::filtered::Filter;
-use crate::quantized::{QuantizerState, quantized_distance_from_codes};
+use crate::pq::{PQConfig, ProductQuantizer};
+use crate::quantized::{quantized_distance_from_codes, QuantizerState};
 use crate::rabitq::RaBitQ;
-use crate::pq::{ProductQuantizer, PQConfig};
 use crate::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
-use crate::{beam_search, BeamSearchConfig, GraphIndex, DiskANN, DiskAnnError, DiskAnnParams, PAD_U32};
 use crate::Distance;
+use crate::{
+    beam_search, BeamSearchConfig, DiskANN, DiskAnnError, DiskAnnParams, GraphIndex, PAD_U32,
+};
 use rayon::prelude::*;
-use std::collections::{BinaryHeap, HashSet};
 use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::RwLock;
 
 /// Magic number for incremental index format: "INCR"
@@ -87,7 +89,7 @@ impl Default for IncrementalConfig {
             delta_threshold: 10_000,
             tombstone_ratio_threshold: 0.1,
             delta_params: DiskAnnParams {
-                max_degree: 32,        // Smaller for delta
+                max_degree: 32, // Smaller for delta
                 build_beam_width: 64,
                 alpha: 1.2,
             },
@@ -112,7 +114,7 @@ impl Default for IncrementalQuantizedConfig {
 #[derive(Clone, Copy)]
 struct Candidate {
     dist: f32,
-    id: u64,  // Global ID (base or delta)
+    id: u64, // Global ID (base or delta)
 }
 
 impl PartialEq for Candidate {
@@ -230,7 +232,8 @@ impl DeltaLayer {
         }
 
         // Find closest to centroid
-        let (best_idx, _) = self.vectors
+        let (best_idx, _) = self
+            .vectors
             .iter()
             .enumerate()
             .map(|(idx, v)| (idx, dist.eval(&centroid, v)))
@@ -253,7 +256,8 @@ impl DeltaLayer {
             self.greedy_search_internal(query, entry as usize, beam_width, dist)
         } else {
             // No entry point yet, just compute distances to all
-            self.vectors.iter()
+            self.vectors
+                .iter()
                 .enumerate()
                 .filter(|(i, _)| *i != node_idx)
                 .map(|(i, v)| (i as u32, dist.eval(query, v)))
@@ -280,7 +284,10 @@ impl DeltaLayer {
         let mut results: BinaryHeap<Candidate> = BinaryHeap::new();
 
         let start_dist = dist.eval(query, &self.vectors[start]);
-        let start_cand = Candidate { dist: start_dist, id: start as u64 };
+        let start_cand = Candidate {
+            dist: start_dist,
+            id: start as u64,
+        };
         frontier.push(Reverse(start_cand));
         results.push(start_cand);
         visited.insert(start);
@@ -307,7 +314,10 @@ impl DeltaLayer {
                     }
 
                     let d = dist.eval(query, &self.vectors[nb_idx]);
-                    let cand = Candidate { dist: d, id: nb as u64 };
+                    let cand = Candidate {
+                        dist: d,
+                        id: nb as u64,
+                    };
 
                     if results.len() < beam_width {
                         results.push(cand);
@@ -321,7 +331,8 @@ impl DeltaLayer {
             }
         }
 
-        results.into_vec()
+        results
+            .into_vec()
             .into_iter()
             .map(|c| (c.id as u32, c.dist))
             .collect()
@@ -350,10 +361,7 @@ impl DeltaLayer {
 
             let mut ok = true;
             for &sel in &pruned {
-                let d = dist.eval(
-                    &self.vectors[cand_id as usize],
-                    &self.vectors[sel as usize],
-                );
+                let d = dist.eval(&self.vectors[cand_id as usize], &self.vectors[sel as usize]);
                 if d < alpha * cand_dist {
                     ok = false;
                     break;
@@ -388,7 +396,8 @@ impl DeltaLayer {
         results.truncate(k);
 
         // Convert local IDs to global delta IDs
-        results.into_iter()
+        results
+            .into_iter()
             .map(|(local_id, d)| (DELTA_ID_OFFSET + local_id as u64, d))
             .collect()
     }
@@ -438,7 +447,13 @@ impl<'a, D: Distance<f32> + Copy + Send + Sync + 'static> UnifiedView<'a, D> {
         dist: D,
     ) -> Self {
         let base_count = base.map(|b| b.num_vectors).unwrap_or(0);
-        Self { base, delta, tombstones, dist, base_count }
+        Self {
+            base,
+            delta,
+            tombstones,
+            dist,
+            base_count,
+        }
     }
 
     /// Return entry points for multi-seed search: one from base (if any) and one from delta (if any).
@@ -595,10 +610,7 @@ where
     D: Distance<f32> + Send + Sync + Copy + Clone + Default + 'static,
 {
     /// Build a new incremental index with default parameters
-    pub fn build_default(
-        vectors: &[Vec<f32>],
-        file_path: &str,
-    ) -> Result<Self, DiskAnnError> {
+    pub fn build_default(vectors: &[Vec<f32>], file_path: &str) -> Result<Self, DiskAnnError> {
         Self::build_with_config(vectors, file_path, IncrementalConfig::default())
     }
 
@@ -889,7 +901,9 @@ where
             if v.len() != self.dim {
                 return Err(DiskAnnError::IndexError(format!(
                     "Vector {} has dimension {} but index expects {}",
-                    i, v.len(), self.dim
+                    i,
+                    v.len(),
+                    self.dim
                 )));
             }
         }
@@ -928,7 +942,9 @@ where
             if v.len() != self.dim {
                 return Err(DiskAnnError::IndexError(format!(
                     "Vector {} has dimension {} but index expects {}",
-                    i, v.len(), self.dim
+                    i,
+                    v.len(),
+                    self.dim
                 )));
             }
         }
@@ -938,7 +954,9 @@ where
             if self.num_label_fields > 0 && l.len() != self.num_label_fields {
                 return Err(DiskAnnError::IndexError(format!(
                     "Label {} has {} fields, expected {}",
-                    i, l.len(), self.num_label_fields
+                    i,
+                    l.len(),
+                    self.num_label_fields
                 )));
             }
         }
@@ -997,7 +1015,11 @@ where
 
             let prep = quantizer.prepare(query);
 
-            let search_k = if rerank_size > 0 { rerank_size.max(k) } else { k };
+            let search_k = if rerank_size > 0 {
+                rerank_size.max(k)
+            } else {
+                k
+            };
 
             // Use expanded beam for tombstone filtering
             let tombstone_count = tombstones.len();
@@ -1016,8 +1038,7 @@ where
                     if id_usize < base_count {
                         // Use quantized distance for base vectors
                         quantized_distance_from_codes(
-                            &self.dist,
-                            query, id_usize, base_codes, code_size, quantizer, &prep,
+                            &self.dist, query, id_usize, base_codes, code_size, quantizer, &prep,
                         )
                     } else {
                         // Use exact distance for delta vectors
@@ -1163,12 +1184,7 @@ where
     }
 
     /// Parallel batch search
-    pub fn search_batch(
-        &self,
-        queries: &[Vec<f32>],
-        k: usize,
-        beam_width: usize,
-    ) -> Vec<Vec<u64>> {
+    pub fn search_batch(&self, queries: &[Vec<f32>], k: usize, beam_width: usize) -> Vec<Vec<u64>> {
         queries
             .par_iter()
             .map(|q| self.search(q, k, beam_width))
@@ -1266,7 +1282,7 @@ where
 
         if all_vectors.is_empty() {
             return Err(DiskAnnError::IndexError(
-                "Cannot compact: no vectors remaining after removing tombstones".to_string()
+                "Cannot compact: no vectors remaining after removing tombstones".to_string(),
             ));
         }
 
@@ -1425,9 +1441,15 @@ where
     /// Load an incremental index from bytes.
     ///
     /// Supports both old format (has_base byte first) and new format (INCR magic).
-    pub fn from_bytes(bytes: &[u8], dist: D, config: IncrementalConfig) -> Result<Self, DiskAnnError> {
+    pub fn from_bytes(
+        bytes: &[u8],
+        dist: D,
+        config: IncrementalConfig,
+    ) -> Result<Self, DiskAnnError> {
         if bytes.len() < 4 {
-            return Err(DiskAnnError::IndexError("Incremental buffer too small".into()));
+            return Err(DiskAnnError::IndexError(
+                "Incremental buffer too small".into(),
+            ));
         }
 
         // Detect format: check for INCR magic
@@ -1441,13 +1463,19 @@ where
     }
 
     /// Parse old format (backward compatible)
-    fn from_bytes_legacy(bytes: &[u8], dist: D, config: IncrementalConfig) -> Result<Self, DiskAnnError> {
+    fn from_bytes_legacy(
+        bytes: &[u8],
+        dist: D,
+        config: IncrementalConfig,
+    ) -> Result<Self, DiskAnnError> {
         let mut pos = 0;
 
         macro_rules! read_bytes {
             ($n:expr) => {{
                 if pos + $n > bytes.len() {
-                    return Err(DiskAnnError::IndexError("Incremental buffer truncated".into()));
+                    return Err(DiskAnnError::IndexError(
+                        "Incremental buffer truncated".into(),
+                    ));
                 }
                 let slice = &bytes[pos..pos + $n];
                 pos += $n;
@@ -1533,13 +1561,19 @@ where
 
     /// Parse new format (v1 with magic/version)
     #[allow(unused_assignments)]
-    fn from_bytes_v1(bytes: &[u8], dist: D, config: IncrementalConfig) -> Result<Self, DiskAnnError> {
+    fn from_bytes_v1(
+        bytes: &[u8],
+        dist: D,
+        config: IncrementalConfig,
+    ) -> Result<Self, DiskAnnError> {
         let mut pos = 0;
 
         macro_rules! read_bytes {
             ($n:expr) => {{
                 if pos + $n > bytes.len() {
-                    return Err(DiskAnnError::IndexError("Incremental buffer truncated".into()));
+                    return Err(DiskAnnError::IndexError(
+                        "Incremental buffer truncated".into(),
+                    ));
                 }
                 let slice = &bytes[pos..pos + $n];
                 pos += $n;
@@ -1745,11 +1779,7 @@ fn encode_all_vecs<Q: VectorQuantizer>(
     flat
 }
 
-fn encode_all_pq_vecs(
-    vectors: &[Vec<f32>],
-    pq: &ProductQuantizer,
-    code_size: usize,
-) -> Vec<u8> {
+fn encode_all_pq_vecs(vectors: &[Vec<f32>], pq: &ProductQuantizer, code_size: usize) -> Vec<u8> {
     let encoded: Vec<Vec<u8>> = vectors.par_iter().map(|v| pq.encode(v)).collect();
     let mut flat = Vec::with_capacity(vectors.len() * code_size);
     for code in &encoded {
@@ -1769,7 +1799,11 @@ mod tests {
     use std::fs;
 
     fn euclid(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt()
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f32>()
+            .sqrt()
     }
 
     #[test]
@@ -1799,10 +1833,7 @@ mod tests {
         let path = "test_incremental_add.db";
         let _ = fs::remove_file(path);
 
-        let vectors = vec![
-            vec![0.0, 0.0],
-            vec![1.0, 0.0],
-        ];
+        let vectors = vec![vec![0.0, 0.0], vec![1.0, 0.0]];
 
         let index = IncrementalDiskANN::<DistL2>::build_default(&vectors, path).unwrap();
 
@@ -1818,7 +1849,11 @@ mod tests {
 
         // The closest should be the one we just added at [0.5, 0.5]
         let (_best_id, best_dist) = results[0];
-        assert!(best_dist < 0.01, "Expected to find [0.5, 0.5], got dist {}", best_dist);
+        assert!(
+            best_dist < 0.01,
+            "Expected to find [0.5, 0.5], got dist {}",
+            best_dist
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -1829,9 +1864,9 @@ mod tests {
         let _ = fs::remove_file(path);
 
         let vectors = vec![
-            vec![0.0, 0.0],  // id 0
-            vec![1.0, 0.0],  // id 1
-            vec![0.0, 1.0],  // id 2
+            vec![0.0, 0.0], // id 0
+            vec![1.0, 0.0], // id 1
+            vec![0.0, 1.0], // id 2
         ];
 
         let index = IncrementalDiskANN::<DistL2>::build_default(&vectors, path).unwrap();
@@ -1842,7 +1877,10 @@ mod tests {
 
         // Search near [0,0] should not return id 0
         let results = index.search(&[0.0, 0.0], 3, 8);
-        assert!(!results.contains(&0), "Deleted vector should not appear in results");
+        assert!(
+            !results.contains(&0),
+            "Deleted vector should not appear in results"
+        );
 
         let _ = fs::remove_file(path);
     }
@@ -1864,7 +1902,9 @@ mod tests {
         let mut index = IncrementalDiskANN::<DistL2>::build_default(&vectors, path1).unwrap();
 
         // Add some vectors
-        index.add_vectors(&[vec![2.0, 2.0], vec![3.0, 3.0]]).unwrap();
+        index
+            .add_vectors(&[vec![2.0, 2.0], vec![3.0, 3.0]])
+            .unwrap();
 
         // Delete some
         index.delete_vectors(&[0, 1]).unwrap();
@@ -1931,7 +1971,9 @@ mod tests {
         let index = IncrementalDiskANN::<DistL2>::build_default(&vectors, path).unwrap();
 
         // Add delta vectors
-        index.add_vectors(&[vec![0.5, 0.5], vec![2.0, 2.0]]).unwrap();
+        index
+            .add_vectors(&[vec![0.5, 0.5], vec![2.0, 2.0]])
+            .unwrap();
 
         // Delete one
         index.delete_vectors(&[0]).unwrap();
@@ -1939,8 +1981,11 @@ mod tests {
         let bytes = index.to_bytes();
 
         let index2 = IncrementalDiskANN::<DistL2>::from_bytes(
-            &bytes, DistL2 {}, IncrementalConfig::default()
-        ).unwrap();
+            &bytes,
+            DistL2 {},
+            IncrementalConfig::default(),
+        )
+        .unwrap();
 
         let stats = index2.stats();
         assert_eq!(stats.base_vectors, 4);
@@ -1959,11 +2004,7 @@ mod tests {
         let path = "test_incr_compat.db";
         let _ = fs::remove_file(path);
 
-        let vectors = vec![
-            vec![0.0, 0.0],
-            vec![1.0, 0.0],
-            vec![0.0, 1.0],
-        ];
+        let vectors = vec![vec![0.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0]];
 
         // Build old-format bytes manually: [has_base:u8][base_len:u64][base_bytes][dim:u64]...
         let base = DiskANN::<DistL2>::build_index_default(&vectors, DistL2 {}, path).unwrap();
@@ -1980,8 +2021,11 @@ mod tests {
         old_bytes.extend_from_slice(&0u64.to_le_bytes()); // num_tombstones = 0
 
         let loaded = IncrementalDiskANN::<DistL2>::from_bytes(
-            &old_bytes, DistL2 {}, IncrementalConfig::default()
-        ).unwrap();
+            &old_bytes,
+            DistL2 {},
+            IncrementalConfig::default(),
+        )
+        .unwrap();
 
         assert_eq!(loaded.stats().base_vectors, 3);
         assert_eq!(loaded.stats().delta_vectors, 0);

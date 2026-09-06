@@ -114,13 +114,20 @@ impl F16Quantizer {
 }
 
 impl VectorQuantizer for F16Quantizer {
-    fn encode(&self, vector: &[f32]) -> Vec<u8> { self.prepare(vector).iter().flat_map(|h| h.0.to_le_bytes()).collect() }
+    fn encode(&self, vector: &[f32]) -> Vec<u8> {
+        self.prepare(vector)
+            .iter()
+            .flat_map(|h| h.0.to_le_bytes())
+            .collect()
+    }
     fn decode(&self, codes: &[u8]) -> Vec<f32> {
         let mut out = vec![0.0f32; self.dim];
         cast(f16_codes(codes), &mut out).expect("Code length mismatch");
         out
     }
-    fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 { self.distance_f16(&self.prepare(query), codes) }
+    fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 {
+        self.distance_f16(&self.prepare(query), codes)
+    }
 
     fn compression_ratio(&self, dim: usize) -> f32 {
         (dim * 4) as f32 / (dim * 2) as f32
@@ -138,25 +145,57 @@ impl VectorQuantizer for F16Quantizer {
 ///
 /// Trained from sample vectors to learn the per-dimension ranges.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Int8Quantizer { dim: usize, scale: f32, offset: f32 }
+pub struct Int8Quantizer {
+    dim: usize,
+    scale: f32,
+    offset: f32,
+}
 
 impl Int8Quantizer {
     pub fn train(vectors: &[Vec<f32>]) -> Result<Self, DiskAnnError> {
-        let dim = vectors.first().map(|v| v.len()).ok_or_else(|| DiskAnnError::IndexError("No vectors to train on".into()))?;
+        let dim = vectors
+            .first()
+            .map(|v| v.len())
+            .ok_or_else(|| DiskAnnError::IndexError("No vectors to train on".into()))?;
         let (mut lo, mut hi) = (f32::MAX, f32::MIN);
         for v in vectors {
-            if v.len() != dim { return Err(DiskAnnError::IndexError(format!("Dimension mismatch: expected {}, got {}", dim, v.len()))); }
-            for &x in v { lo = lo.min(x); hi = hi.max(x); }
+            if v.len() != dim {
+                return Err(DiskAnnError::IndexError(format!(
+                    "Dimension mismatch: expected {}, got {}",
+                    dim,
+                    v.len()
+                )));
+            }
+            for &x in v {
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
         }
         let range = hi - lo;
-        Ok(Self { dim, scale: if range.abs() < f32::EPSILON { 1.0 } else { range / 255.0 }, offset: lo })
+        Ok(Self {
+            dim,
+            scale: if range.abs() < f32::EPSILON {
+                1.0
+            } else {
+                range / 255.0
+            },
+            offset: lo,
+        })
     }
-    pub fn from_params(dim: usize, scale: f32, offset: f32) -> Self { Self { dim, scale, offset } }
-    pub fn scale(&self) -> f32 { self.scale }
-    pub fn offset(&self) -> f32 { self.offset }
+    pub fn from_params(dim: usize, scale: f32, offset: f32) -> Self {
+        Self { dim, scale, offset }
+    }
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+    pub fn offset(&self) -> f32 {
+        self.offset
+    }
     #[inline]
     pub fn distance_u8(&self, query: &[u8], codes: &[u8]) -> f32 {
-        u8::sqeuclidean(query, codes).expect("Code length mismatch") as f32 * self.scale * self.scale
+        u8::sqeuclidean(query, codes).expect("Code length mismatch") as f32
+            * self.scale
+            * self.scale
     }
 
     /// Get the vector dimension.
@@ -195,13 +234,26 @@ impl Int8Quantizer {
 impl VectorQuantizer for Int8Quantizer {
     fn encode(&self, vector: &[f32]) -> Vec<u8> {
         let mut scaled = vec![0.0f32; self.dim];
-        f32::each_scale(vector, 1.0 / self.scale, -self.offset / self.scale, &mut scaled).expect("Vector dimension mismatch");
+        f32::each_scale(
+            vector,
+            1.0 / self.scale,
+            -self.offset / self.scale,
+            &mut scaled,
+        )
+        .expect("Vector dimension mismatch");
         let mut codes = vec![0u8; self.dim];
         cast(&scaled, &mut codes).unwrap(); // rounds + saturates to [0,255] (verified)
         codes
     }
-    fn decode(&self, codes: &[u8]) -> Vec<f32> { codes.iter().map(|&c| c as f32 * self.scale + self.offset).collect() }
-    fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 { self.distance_u8(&self.encode(query), codes) }
+    fn decode(&self, codes: &[u8]) -> Vec<f32> {
+        codes
+            .iter()
+            .map(|&c| c as f32 * self.scale + self.offset)
+            .collect()
+    }
+    fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 {
+        self.distance_u8(&self.encode(query), codes)
+    }
 
     fn compression_ratio(&self, dim: usize) -> f32 {
         (dim * 4) as f32 / dim as f32
@@ -291,9 +343,16 @@ mod tests {
 
         let dist = q.asymmetric_distance(&query, &codes);
         let decoded = q.decode(&codes);
-        let expected: f32 = query.iter().zip(&decoded).map(|(a, b)| (a - b) * (a - b)).sum();
+        let expected: f32 = query
+            .iter()
+            .zip(&decoded)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
 
-        assert!((dist - expected).abs() < 0.1, "dist={dist}, expected={expected}");
+        assert!(
+            (dist - expected).abs() < 0.1,
+            "dist={dist}, expected={expected}"
+        );
     }
 
     #[test]
@@ -303,7 +362,11 @@ mod tests {
         for v in &vectors {
             let codes = q.encode(v);
             let decoded = q.decode(&codes);
-            let max_err: f32 = v.iter().zip(&decoded).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            let max_err: f32 = v
+                .iter()
+                .zip(&decoded)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
             assert!(max_err < 0.05, "Max f16 error too high: {max_err}");
         }
     }
@@ -348,7 +411,11 @@ mod tests {
         assert_eq!(decoded.len(), 32);
 
         // Reconstruction error should be small relative to range
-        let max_err: f32 = original.iter().zip(&decoded).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        let max_err: f32 = original
+            .iter()
+            .zip(&decoded)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
         // Each dimension has range ~10 (from -5 to 5), quantized to 256 levels
         // So max error should be ~10/255 ≈ 0.04
         assert!(max_err < 0.1, "Max int8 error too high: {max_err}");
@@ -365,10 +432,17 @@ mod tests {
 
         let asym_dist = q.asymmetric_distance(query, &codes);
         let decoded = q.decode(&codes);
-        let expected: f32 = query.iter().zip(&decoded).map(|(a, b)| (a - b) * (a - b)).sum();
+        let expected: f32 = query
+            .iter()
+            .zip(&decoded)
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
 
         // Should be very close since both use same dequantization
-        assert!((asym_dist - expected).abs() < 0.01 * expected, "asym={asym_dist}, expected={expected}");
+        assert!(
+            (asym_dist - expected).abs() < 0.01 * expected,
+            "asym={asym_dist}, expected={expected}"
+        );
     }
 
     #[test]
@@ -428,7 +502,8 @@ mod tests {
         let query = &vectors[0];
 
         // True distances
-        let mut true_dists: Vec<(usize, f32)> = vectors.iter()
+        let mut true_dists: Vec<(usize, f32)> = vectors
+            .iter()
             .enumerate()
             .skip(1)
             .map(|(i, v)| {
@@ -440,7 +515,8 @@ mod tests {
 
         // Quantized distances
         let codes: Vec<Vec<u8>> = vectors.iter().map(|v| q.encode(v)).collect();
-        let mut quant_dists: Vec<(usize, f32)> = codes.iter()
+        let mut quant_dists: Vec<(usize, f32)> = codes
+            .iter()
             .enumerate()
             .skip(1)
             .map(|(i, c)| (i, q.asymmetric_distance(query, c)))
@@ -448,8 +524,10 @@ mod tests {
         quant_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
         // Check recall@10
-        let true_top10: std::collections::HashSet<_> = true_dists.iter().take(10).map(|(i, _)| *i).collect();
-        let quant_top10: std::collections::HashSet<_> = quant_dists.iter().take(10).map(|(i, _)| *i).collect();
+        let true_top10: std::collections::HashSet<_> =
+            true_dists.iter().take(10).map(|(i, _)| *i).collect();
+        let quant_top10: std::collections::HashSet<_> =
+            quant_dists.iter().take(10).map(|(i, _)| *i).collect();
         let recall = true_top10.intersection(&quant_top10).count() as f32 / 10.0;
         assert!(recall >= 0.6, "Int8 recall@10 too low: {recall}");
     }

@@ -107,7 +107,11 @@ fn benchmark_build_time() -> Vec<BuildResult> {
             .unwrap();
             let elapsed = start.elapsed().as_secs_f64();
 
-            println!("  diskann-rs: {:.2}s ({:.0} vec/s)", elapsed, n as f64 / elapsed);
+            println!(
+                "  diskann-rs: {:.2}s ({:.0} vec/s)",
+                elapsed,
+                n as f64 / elapsed
+            );
             results.push(BuildResult {
                 library: "diskann-rs".into(),
                 num_vectors: n,
@@ -128,7 +132,11 @@ fn benchmark_build_time() -> Vec<BuildResult> {
 
             let elapsed = start.elapsed().as_secs_f64();
 
-            println!("  hnsw_rs:    {:.2}s ({:.0} vec/s)", elapsed, n as f64 / elapsed);
+            println!(
+                "  hnsw_rs:    {:.2}s ({:.0} vec/s)",
+                elapsed,
+                n as f64 / elapsed
+            );
             results.push(BuildResult {
                 library: "hnsw_rs".into(),
                 num_vectors: n,
@@ -176,7 +184,11 @@ fn plot_build_time(results: &[BuildResult]) -> Result<(), Box<dyn std::error::Er
         .label("diskann-rs")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE));
 
-    chart.draw_series(diskann_data.iter().map(|(x, y)| Circle::new((*x, *y), 5, BLUE.filled())))?;
+    chart.draw_series(
+        diskann_data
+            .iter()
+            .map(|(x, y)| Circle::new((*x, *y), 5, BLUE.filled())),
+    )?;
 
     // hnsw_rs line
     let hnsw_data: Vec<(usize, f64)> = results
@@ -190,7 +202,11 @@ fn plot_build_time(results: &[BuildResult]) -> Result<(), Box<dyn std::error::Er
         .label("hnsw_rs")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
 
-    chart.draw_series(hnsw_data.iter().map(|(x, y)| Circle::new((*x, *y), 5, RED.filled())))?;
+    chart.draw_series(
+        hnsw_data
+            .iter()
+            .map(|(x, y)| Circle::new((*x, *y), 5, RED.filled())),
+    )?;
 
     chart
         .configure_series_labels()
@@ -258,7 +274,10 @@ fn benchmark_recall_qps() -> Vec<RecallQpsResult> {
 
     let params = vec![16, 32, 64, 128, 256, 512];
 
-    println!("\n{:>10} {:>10} {:>10} {:>10}", "Library", "Param", "Recall", "QPS");
+    println!(
+        "\n{:>10} {:>10} {:>10} {:>10}",
+        "Library", "Param", "Recall", "QPS"
+    );
     println!("{}", "-".repeat(45));
 
     for &param in &params {
@@ -280,7 +299,10 @@ fn benchmark_recall_qps() -> Vec<RecallQpsResult> {
             let recall = calculate_recall(&search_results, &ground_truth, k);
             let qps = n_queries as f64 / elapsed;
 
-            println!("{:>10} {:>10} {:>10.4} {:>10.0}", "diskann-rs", param, recall, qps);
+            println!(
+                "{:>10} {:>10} {:>10.4} {:>10.0}",
+                "diskann-rs", param, recall, qps
+            );
             results.push(RecallQpsResult {
                 library: "diskann-rs".into(),
                 param,
@@ -306,7 +328,10 @@ fn benchmark_recall_qps() -> Vec<RecallQpsResult> {
             let recall = calculate_recall(&search_results, &ground_truth, k);
             let qps = n_queries as f64 / elapsed;
 
-            println!("{:>10} {:>10} {:>10.4} {:>10.0}", "hnsw_rs", param, recall, qps);
+            println!(
+                "{:>10} {:>10} {:>10.4} {:>10.0}",
+                "hnsw_rs", param, recall, qps
+            );
             results.push(RecallQpsResult {
                 library: "hnsw_rs".into(),
                 param,
@@ -354,7 +379,11 @@ fn plot_recall_qps(results: &[RecallQpsResult]) -> Result<(), Box<dyn std::error
         .label("diskann-rs")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE));
 
-    chart.draw_series(diskann_data.iter().map(|(x, y)| Circle::new((*x, *y), 5, BLUE.filled())))?;
+    chart.draw_series(
+        diskann_data
+            .iter()
+            .map(|(x, y)| Circle::new((*x, *y), 5, BLUE.filled())),
+    )?;
 
     // hnsw_rs
     let hnsw_data: Vec<(f64, f64)> = results
@@ -368,7 +397,11 @@ fn plot_recall_qps(results: &[RecallQpsResult]) -> Result<(), Box<dyn std::error
         .label("hnsw_rs")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
 
-    chart.draw_series(hnsw_data.iter().map(|(x, y)| Circle::new((*x, *y), 5, RED.filled())))?;
+    chart.draw_series(
+        hnsw_data
+            .iter()
+            .map(|(x, y)| Circle::new((*x, *y), 5, RED.filled())),
+    )?;
 
     chart
         .configure_series_labels()
@@ -440,7 +473,8 @@ fn benchmark_memory() -> Vec<MemoryResult> {
 
     println!("Building diskann-rs index...");
     {
-        let _diskann_index = DiskANN::<DistL2>::build_index_default(&data, DistL2 {}, diskann_path).unwrap();
+        let _diskann_index =
+            DiskANN::<DistL2>::build_index_default(&data, DistL2 {}, diskann_path).unwrap();
         // Index built and dropped, file remains on disk
     }
     let index_file_mb = fs::metadata(diskann_path)
@@ -458,9 +492,15 @@ fn benchmark_memory() -> Vec<MemoryResult> {
     let hnsw_base_ram = (hnsw_after - hnsw_before).max(50.0);
 
     println!("\nIndex file size: {:.1} MB", index_file_mb);
-    println!("hnsw_rs base RAM: {:.1} MB (must hold full index)", hnsw_base_ram);
+    println!(
+        "hnsw_rs base RAM: {:.1} MB (must hold full index)",
+        hnsw_base_ram
+    );
 
-    println!("\n{:<30} {:>15} {:>15}", "Scenario", "diskann-rs", "hnsw_rs");
+    println!(
+        "\n{:<30} {:>15} {:>15}",
+        "Scenario", "diskann-rs", "hnsw_rs"
+    );
     println!("{}", "-".repeat(62));
 
     for (scenario_name, num_queries, beam_width) in &scenarios {
@@ -521,7 +561,10 @@ fn benchmark_memory() -> Vec<MemoryResult> {
 
     println!("\nKey observations:");
     println!("  - diskann-rs RAM varies with workload (pages loaded on-demand)");
-    println!("  - hnsw_rs requires {:.0} MB RAM constantly (full index)", hnsw_base_ram);
+    println!(
+        "  - hnsw_rs requires {:.0} MB RAM constantly (full index)",
+        hnsw_base_ram
+    );
     println!("  - Under memory pressure, OS evicts diskann-rs pages automatically");
 
     let _ = fs::remove_file(diskann_path);
@@ -557,7 +600,10 @@ fn plot_memory(results: &[MemoryResult]) -> Result<(), Box<dyn std::error::Error
     let (chart_area, label_area) = root.split_vertically(390);
 
     let mut chart = ChartBuilder::on(&chart_area)
-        .caption("RAM Usage: Memory-Mapped vs In-Memory (200K vectors)", ("sans-serif", 20).into_font())
+        .caption(
+            "RAM Usage: Memory-Mapped vs In-Memory (200K vectors)",
+            ("sans-serif", 20).into_font(),
+        )
         .margin(20)
         .x_label_area_size(30) // Reduced since we draw labels ourselves
         .y_label_area_size(70)
@@ -568,7 +614,7 @@ fn plot_memory(results: &[MemoryResult]) -> Result<(), Box<dyn std::error::Error
         .y_desc("RAM Usage (MB)")
         .y_label_formatter(&|y| format!("{:.0}", y))
         .disable_x_mesh()
-        .disable_x_axis()  // We'll draw our own x-axis labels
+        .disable_x_axis() // We'll draw our own x-axis labels
         .draw()?;
 
     let bar_width = 0.35;
@@ -602,7 +648,6 @@ fn plot_memory(results: &[MemoryResult]) -> Result<(), Box<dyn std::error::Error
                 ("sans-serif", 10).into_font().color(&BLACK),
             )))?;
         }
-
     }
 
     // Draw x-axis labels in the label area (below the chart)
@@ -783,7 +828,10 @@ fn plot_incremental(results: &[IncrementalResult]) -> Result<(), Box<dyn std::er
     let max_rate = diskann_add.max(hnsw_add) * 1.3;
 
     let mut chart = ChartBuilder::on(&root)
-        .caption("Incremental Add Performance", ("sans-serif", 22).into_font())
+        .caption(
+            "Incremental Add Performance",
+            ("sans-serif", 22).into_font(),
+        )
         .margin(20)
         .x_label_area_size(60)
         .y_label_area_size(80)

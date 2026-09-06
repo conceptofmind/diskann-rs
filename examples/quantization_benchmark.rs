@@ -4,7 +4,7 @@
 //!
 //! Outputs data for compression ratio vs recall chart.
 
-use diskann_rs::pq::{ProductQuantizer, PQConfig};
+use diskann_rs::pq::{PQConfig, ProductQuantizer};
 use diskann_rs::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
 use rand::prelude::*;
 use rand::SeedableRng;
@@ -18,7 +18,10 @@ fn main() {
 
     println!("Quantization Benchmark");
     println!("======================");
-    println!("Vectors: {}, Dim: {}, Queries: {}, k: {}\n", n_vectors, dim, n_queries, k);
+    println!(
+        "Vectors: {}, Dim: {}, Queries: {}, k: {}\n",
+        n_vectors, dim, n_queries, k
+    );
 
     // Generate random vectors
     let mut rng = StdRng::seed_from_u64(42);
@@ -43,7 +46,10 @@ fn main() {
         })
         .collect();
 
-    println!("| Method | Compression | Code Size | Encode Time | Search Time | Recall@{} |", k);
+    println!(
+        "| Method | Compression | Code Size | Encode Time | Search Time | Recall@{} |",
+        k
+    );
     println!("|--------|-------------|-----------|-------------|-------------|----------|");
 
     // Baseline (no compression)
@@ -160,7 +166,12 @@ fn main() {
         let codes: Vec<Vec<u8>> = vectors.iter().map(|v| q.encode(v)).collect();
         let recall = compute_recall_pq(&q, &queries, &codes, &ground_truth, k);
         let compression = baseline_size as f32 / num_subspaces as f32;
-        println!("PQ-{},{:.1},{:.1}", num_subspaces, compression, recall * 100.0);
+        println!(
+            "PQ-{},{:.1},{:.1}",
+            num_subspaces,
+            compression,
+            recall * 100.0
+        );
     }
 }
 

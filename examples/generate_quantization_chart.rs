@@ -36,12 +36,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Colors for each method
     let colors = [
-        RGBColor(100, 100, 100),  // None - gray
-        RGBColor(52, 152, 219),   // F16 - blue
-        RGBColor(46, 204, 113),   // Int8 - green
-        RGBColor(155, 89, 182),   // PQ-32 - purple
-        RGBColor(230, 126, 34),   // PQ-16 - orange
-        RGBColor(231, 76, 60),    // PQ-8 - red
+        RGBColor(100, 100, 100), // None - gray
+        RGBColor(52, 152, 219),  // F16 - blue
+        RGBColor(46, 204, 113),  // Int8 - green
+        RGBColor(155, 89, 182),  // PQ-32 - purple
+        RGBColor(230, 126, 34),  // PQ-16 - orange
+        RGBColor(231, 76, 60),   // PQ-8 - red
     ];
 
     // Draw connecting line (gray)
@@ -53,13 +53,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Draw points and labels
     for (i, (label, x, y)) in data.iter().enumerate() {
         // Draw circle
-        chart.draw_series(std::iter::once(Circle::new(
-            (*x, *y),
-            6,
-            colors[i].filled(),
-        )))?
-        .label(*label)
-        .legend(move |(lx, ly)| Circle::new((lx + 10, ly), 5, colors[i].filled()));
+        chart
+            .draw_series(std::iter::once(Circle::new(
+                (*x, *y),
+                6,
+                colors[i].filled(),
+            )))?
+            .label(*label)
+            .legend(move |(lx, ly)| Circle::new((lx + 10, ly), 5, colors[i].filled()));
     }
 
     // Draw legend

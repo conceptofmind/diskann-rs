@@ -35,7 +35,7 @@ struct BenchResult {
     k: usize,
     beam_width: usize,
     build_time_ms: f64,
-    build_throughput: f64,  // vectors/sec
+    build_throughput: f64, // vectors/sec
     query_time_us_p50: f64,
     query_time_us_p95: f64,
     query_time_us_p99: f64,
@@ -49,8 +49,19 @@ impl BenchResult {
         println!("{}", "=".repeat(120));
         println!(
             "{:<20} {:>8} {:>6} {:>4} {:>6} {:>10} {:>12} {:>10} {:>10} {:>10} {:>10} {:>8} {:>8}",
-            "Benchmark", "Vectors", "Dim", "K", "Beam", "Build(ms)", "Build(vec/s)",
-            "P50(μs)", "P95(μs)", "P99(μs)", "QPS", "Recall", "Size(MB)"
+            "Benchmark",
+            "Vectors",
+            "Dim",
+            "K",
+            "Beam",
+            "Build(ms)",
+            "Build(vec/s)",
+            "P50(μs)",
+            "P95(μs)",
+            "P99(μs)",
+            "QPS",
+            "Recall",
+            "Size(MB)"
         );
         println!("{}", "-".repeat(120));
     }
@@ -75,11 +86,7 @@ fn generate_vectors(num: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
 }
 
 /// Compute ground truth nearest neighbors using brute force
-fn compute_ground_truth(
-    queries: &[Vec<f32>],
-    data: &[Vec<f32>],
-    k: usize,
-) -> Vec<Vec<usize>> {
+fn compute_ground_truth(queries: &[Vec<f32>], data: &[Vec<f32>], k: usize) -> Vec<Vec<usize>> {
     queries
         .par_iter()
         .map(|q| {
@@ -128,8 +135,10 @@ fn run_benchmark(config: &BenchConfig, params: DiskAnnParams) -> Vec<BenchResult
     let index_path = format!("bench_{}.db", config.name);
     let _ = fs::remove_file(&index_path);
 
-    println!("\n[{}] Generating {} vectors of dim {}...",
-             config.name, config.num_vectors, config.dim);
+    println!(
+        "\n[{}] Generating {} vectors of dim {}...",
+        config.name, config.num_vectors, config.dim
+    );
 
     // Generate data
     let data = generate_vectors(config.num_vectors, config.dim, 42);
@@ -140,17 +149,14 @@ fn run_benchmark(config: &BenchConfig, params: DiskAnnParams) -> Vec<BenchResult
     let ground_truth = compute_ground_truth(&queries, &data, config.k);
 
     // Build index
-    println!("[{}] Building index with M={}, L={}, alpha={}...",
-             config.name, params.max_degree, params.build_beam_width, params.alpha);
+    println!(
+        "[{}] Building index with M={}, L={}, alpha={}...",
+        config.name, params.max_degree, params.build_beam_width, params.alpha
+    );
 
     let build_start = Instant::now();
-    let index = DiskANN::<DistL2>::build_index_with_params(
-        &data,
-        DistL2 {},
-        &index_path,
-        params,
-    )
-    .expect("Failed to build index");
+    let index = DiskANN::<DistL2>::build_index_with_params(&data, DistL2 {}, &index_path, params)
+        .expect("Failed to build index");
     let build_time = build_start.elapsed();
 
     let index_size = fs::metadata(&index_path)
@@ -163,7 +169,10 @@ fn run_benchmark(config: &BenchConfig, params: DiskAnnParams) -> Vec<BenchResult
 
     // Run searches at different beam widths
     for &beam_width in &config.beam_widths {
-        println!("[{}] Benchmarking search with beam_width={}...", config.name, beam_width);
+        println!(
+            "[{}] Benchmarking search with beam_width={}...",
+            config.name, beam_width
+        );
 
         // Warm-up
         for q in queries.iter().take(10) {
@@ -247,19 +256,27 @@ fn run_incremental_benchmark() {
         .expect("Failed to build index");
     let build_time = build_start.elapsed();
 
-    println!("\nInitial build: {:?} ({:.0} vec/s)",
-             build_time, initial_size as f64 / build_time.as_secs_f64());
+    println!(
+        "\nInitial build: {:?} ({:.0} vec/s)",
+        build_time,
+        initial_size as f64 / build_time.as_secs_f64()
+    );
 
     // Measure incremental adds
     println!("\nIncremental add performance:");
-    println!("{:>10} {:>12} {:>12} {:>12}", "Batch", "Add Time", "Vec/s", "Total Vecs");
+    println!(
+        "{:>10} {:>12} {:>12} {:>12}",
+        "Batch", "Add Time", "Vec/s", "Total Vecs"
+    );
     println!("{}", "-".repeat(50));
 
     for batch_num in 0..num_batches {
         let batch_data = generate_vectors(batch_size, dim, 100 + batch_num as u64);
 
         let add_start = Instant::now();
-        index.add_vectors(&batch_data).expect("Failed to add vectors");
+        index
+            .add_vectors(&batch_data)
+            .expect("Failed to add vectors");
         let add_time = add_start.elapsed();
 
         let stats = index.stats();
@@ -302,14 +319,12 @@ fn run_baseline_comparison() {
     println!("BASELINE COMPARISON (DiskANN vs Brute Force)");
     println!("{}", "=".repeat(80));
 
-    let configs = vec![
-        (10_000, 128),
-        (50_000, 128),
-        (100_000, 128),
-    ];
+    let configs = vec![(10_000, 128), (50_000, 128), (100_000, 128)];
 
-    println!("\n{:>10} {:>6} {:>12} {:>12} {:>10}",
-             "Vectors", "Dim", "DiskANN(ms)", "BruteF(ms)", "Speedup");
+    println!(
+        "\n{:>10} {:>6} {:>12} {:>12} {:>10}",
+        "Vectors", "Dim", "DiskANN(ms)", "BruteF(ms)", "Speedup"
+    );
     println!("{}", "-".repeat(60));
 
     for (num_vectors, dim) in configs {
@@ -352,7 +367,8 @@ fn run_baseline_comparison() {
 
         println!(
             "{:>10} {:>6} {:>12.2} {:>12.2} {:>10.1}x",
-            num_vectors, dim,
+            num_vectors,
+            dim,
             diskann_time.as_secs_f64() * 1000.0,
             brute_time.as_secs_f64() * 1000.0,
             speedup

@@ -107,16 +107,15 @@ impl ProductQuantizer {
         let subspace_dim = dim / config.num_subspaces;
 
         // Sample training vectors if needed
-        let training_vectors: Vec<&Vec<f32>> = if config.training_sample_size > 0
-            && vectors.len() > config.training_sample_size
-        {
-            let mut rng = thread_rng();
-            vectors
-                .choose_multiple(&mut rng, config.training_sample_size)
-                .collect()
-        } else {
-            vectors.iter().collect()
-        };
+        let training_vectors: Vec<&Vec<f32>> =
+            if config.training_sample_size > 0 && vectors.len() > config.training_sample_size {
+                let mut rng = thread_rng();
+                vectors
+                    .choose_multiple(&mut rng, config.training_sample_size)
+                    .collect()
+            } else {
+                vectors.iter().collect()
+            };
 
         // Train codebook for each subspace (parallel)
         let codebooks_per_subspace: Vec<Vec<f32>> = (0..config.num_subspaces)

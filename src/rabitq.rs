@@ -93,7 +93,9 @@ impl RaBitQ {
         for v in vectors {
             if v.len() != dim {
                 return Err(DiskAnnError::IndexError(format!(
-                    "Dimension mismatch: expected {}, got {}", dim, v.len()
+                    "Dimension mismatch: expected {}, got {}",
+                    dim,
+                    v.len()
                 )));
             }
             centroid.iter_mut().zip(v).for_each(|(c, x)| *c += x);
@@ -104,7 +106,12 @@ impl RaBitQ {
         let signs = (0..ROUNDS * padded)
             .map(|_| if rng.r#gen::<bool>() { scale } else { -scale })
             .collect();
-        Ok(Self { dim, padded, centroid, signs })
+        Ok(Self {
+            dim,
+            padded,
+            centroid,
+            signs,
+        })
     }
 
     pub fn dim(&self) -> usize {
@@ -137,7 +144,10 @@ impl RaBitQ {
     fn prep(&self, v: &[f32]) -> (Vec<f32>, f32) {
         assert_eq!(v.len(), self.dim, "Vector dimension mismatch");
         let mut r = vec![0.0f32; self.padded];
-        r.iter_mut().zip(v).zip(&self.centroid).for_each(|((r, x), c)| *r = x - c);
+        r.iter_mut()
+            .zip(v)
+            .zip(&self.centroid)
+            .for_each(|((r, x), c)| *r = x - c);
         let norm = r.iter().map(|x| x * x).sum::<f32>().sqrt();
         if norm > 0.0 {
             r.iter_mut().for_each(|x| *x /= norm);
@@ -149,7 +159,9 @@ impl RaBitQ {
     /// Per-query precomputation (do once, then `distance` per candidate).
     pub fn query(&self, q: &[f32]) -> RaBitQQuery {
         let (r, nq) = self.prep(q);
-        let (lo, hi) = r.iter().fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+        let (lo, hi) = r
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
         let levels = ((1u32 << QBITS) - 1) as f32;
         let delta = (hi - lo) / levels;
         let inv = if delta > 0.0 { 1.0 / delta } else { 0.0 };
@@ -216,12 +228,21 @@ impl VectorQuantizer for RaBitQ {
             .chunks_exact(8)
             .flat_map(|ch| {
                 let b = u64::from_le_bytes(ch.try_into().unwrap());
-                (0..64).map(move |i| if (b >> i) & 1 == 1 { 1.0 / sd } else { -1.0 / sd })
+                (0..64).map(move |i| {
+                    if (b >> i) & 1 == 1 {
+                        1.0 / sd
+                    } else {
+                        -1.0 / sd
+                    }
+                })
             })
             .collect();
         self.unrotate(&mut r);
         let norm = f32::from_le_bytes(codes[w..w + 4].try_into().unwrap()).sqrt();
-        r.iter().zip(&self.centroid).map(|(x, c)| c + norm * x).collect()
+        r.iter()
+            .zip(&self.centroid)
+            .map(|(x, c)| c + norm * x)
+            .collect()
     }
 
     fn asymmetric_distance(&self, query: &[f32], codes: &[u8]) -> f32 {
@@ -279,7 +300,10 @@ mod tests {
             assert_eq!(q.distance(&pq, c), q.asymmetric_distance(&vs[0], c));
             let est = q.distance(&pq, c);
             let exact = l2(&vs[0], v);
-            assert!((est - exact).abs() < 0.35 * exact + 0.02 * scale, "est={est} exact={exact}");
+            assert!(
+                (est - exact).abs() < 0.35 * exact + 0.02 * scale,
+                "est={est} exact={exact}"
+            );
         }
     }
 
@@ -293,10 +317,20 @@ mod tests {
         assert!(l2(&vs[0], &d) < l2(&vs[0], &vs[1]));
 
         let query = &vs[0];
-        let mut exact: Vec<(usize, f32)> = vs.iter().enumerate().skip(1).map(|(i, v)| (i, l2(query, v))).collect();
+        let mut exact: Vec<(usize, f32)> = vs
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, v)| (i, l2(query, v)))
+            .collect();
         exact.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         let pq = q.query(query);
-        let mut est: Vec<(usize, f32)> = codes.iter().enumerate().skip(1).map(|(i, c)| (i, q.distance(&pq, c))).collect();
+        let mut est: Vec<(usize, f32)> = codes
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, c)| (i, q.distance(&pq, c)))
+            .collect();
         est.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         let top: std::collections::HashSet<usize> = exact.iter().take(10).map(|x| x.0).collect();
         let hits = est.iter().take(30).filter(|x| top.contains(&x.0)).count();

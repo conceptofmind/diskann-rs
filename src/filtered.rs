@@ -42,8 +42,8 @@
 //! let results = index.search_filtered(&query, 10, 128, &filter);
 //! ```
 
-use crate::{beam_search, BeamSearchConfig, GraphIndex, DiskANN, DiskAnnError, DiskAnnParams};
 use crate::Distance;
+use crate::{beam_search, BeamSearchConfig, DiskANN, DiskAnnError, DiskAnnParams, GraphIndex};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -164,18 +164,12 @@ impl Filter {
     pub fn matches(&self, labels: &[u64]) -> bool {
         match self {
             Filter::None => true,
-            Filter::LabelEq { field, value } => {
-                labels.get(*field).map_or(false, |v| v == value)
-            }
+            Filter::LabelEq { field, value } => labels.get(*field).map_or(false, |v| v == value),
             Filter::LabelIn { field, values } => {
                 labels.get(*field).map_or(false, |v| values.contains(v))
             }
-            Filter::LabelLt { field, value } => {
-                labels.get(*field).map_or(false, |v| v < value)
-            }
-            Filter::LabelGt { field, value } => {
-                labels.get(*field).map_or(false, |v| v > value)
-            }
+            Filter::LabelLt { field, value } => labels.get(*field).map_or(false, |v| v < value),
+            Filter::LabelGt { field, value } => labels.get(*field).map_or(false, |v| v > value),
             Filter::LabelRange { field, min, max } => {
                 labels.get(*field).map_or(false, |v| v >= min && v <= max)
             }
@@ -250,12 +244,8 @@ where
 
         // Build the vector index
         let index_path = format!("{}.idx", base_path);
-        let index = DiskANN::<D>::build_index_with_params(
-            vectors,
-            D::default(),
-            &index_path,
-            params,
-        )?;
+        let index =
+            DiskANN::<D>::build_index_with_params(vectors, D::default(), &index_path, params)?;
 
         // Save labels
         let labels_path = format!("{}.labels", base_path);
@@ -313,7 +303,9 @@ where
         }
         let index_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
         if bytes.len() < 8 + index_len {
-            return Err(DiskAnnError::IndexError("Buffer too small for index data".into()));
+            return Err(DiskAnnError::IndexError(
+                "Buffer too small for index data".into(),
+            ));
         }
         let index_bytes = bytes[8..8 + index_len].to_vec();
         let labels_bytes = &bytes[8 + index_len..];
@@ -345,7 +337,9 @@ where
         }
         let index_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
         if bytes.len() < 8 + index_len {
-            return Err(DiskAnnError::IndexError("Buffer too small for index data".into()));
+            return Err(DiskAnnError::IndexError(
+                "Buffer too small for index data".into(),
+            ));
         }
         let index_bytes = bytes[8..8 + index_len].to_vec();
         let labels_bytes = &bytes[8 + index_len..];
@@ -392,7 +386,9 @@ where
         }
         let meta_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
         if bytes.len() < 8 + meta_len {
-            return Err(DiskAnnError::IndexError("Labels buffer too small for metadata".into()));
+            return Err(DiskAnnError::IndexError(
+                "Labels buffer too small for metadata".into(),
+            ));
         }
         let meta: FilteredMetadata = bincode::deserialize(&bytes[8..8 + meta_len])?;
 
@@ -405,7 +401,9 @@ where
                 if offset + 8 > data.len() {
                     return Err(DiskAnnError::IndexError("Labels data truncated".into()));
                 }
-                label_vec.push(u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()));
+                label_vec.push(u64::from_le_bytes(
+                    data[offset..offset + 8].try_into().unwrap(),
+                ));
                 offset += 8;
             }
             labels.push(label_vec);
@@ -554,7 +552,6 @@ where
     pub fn count_matching(&self, filter: &Filter) -> usize {
         self.labels.iter().filter(|l| filter.matches(l)).count()
     }
-
 }
 
 #[cfg(test)]
@@ -592,10 +589,7 @@ mod tests {
 
     #[test]
     fn test_filter_and() {
-        let filter = Filter::and(vec![
-            Filter::label_eq(0, 5),
-            Filter::label_gt(1, 10),
-        ]);
+        let filter = Filter::and(vec![Filter::label_eq(0, 5), Filter::label_gt(1, 10)]);
         assert!(filter.matches(&[5, 15]));
         assert!(!filter.matches(&[5, 5]));
         assert!(!filter.matches(&[4, 15]));
@@ -603,10 +597,7 @@ mod tests {
 
     #[test]
     fn test_filter_or() {
-        let filter = Filter::or(vec![
-            Filter::label_eq(0, 5),
-            Filter::label_eq(0, 10),
-        ]);
+        let filter = Filter::or(vec![Filter::label_eq(0, 5), Filter::label_eq(0, 10)]);
         assert!(filter.matches(&[5]));
         assert!(filter.matches(&[10]));
         assert!(!filter.matches(&[7]));
@@ -619,14 +610,10 @@ mod tests {
         let _ = fs::remove_file(format!("{}.labels", base_path));
 
         // Create vectors with categories
-        let vectors: Vec<Vec<f32>> = (0..100)
-            .map(|i| vec![i as f32, (i * 2) as f32])
-            .collect();
+        let vectors: Vec<Vec<f32>> = (0..100).map(|i| vec![i as f32, (i * 2) as f32]).collect();
 
         // Labels: [category] where category = i % 5
-        let labels: Vec<Vec<u64>> = (0..100)
-            .map(|i| vec![i % 5])
-            .collect();
+        let labels: Vec<Vec<u64>> = (0..100).map(|i| vec![i % 5]).collect();
 
         let index = FilteredDiskANN::<DistL2>::build(&vectors, &labels, base_path).unwrap();
 
@@ -686,9 +673,7 @@ mod tests {
         let _ = fs::remove_file(format!("{}.idx", base_path));
         let _ = fs::remove_file(format!("{}.labels", base_path));
 
-        let vectors: Vec<Vec<f32>> = (0..50)
-            .map(|i| vec![i as f32, i as f32])
-            .collect();
+        let vectors: Vec<Vec<f32>> = (0..50).map(|i| vec![i as f32, i as f32]).collect();
         let labels: Vec<Vec<u64>> = (0..50).map(|i| vec![i % 3, i]).collect();
 
         {
@@ -716,9 +701,7 @@ mod tests {
         let _ = fs::remove_file(format!("{}.idx", base_path));
         let _ = fs::remove_file(format!("{}.labels", base_path));
 
-        let vectors: Vec<Vec<f32>> = (0..50)
-            .map(|i| vec![i as f32, i as f32])
-            .collect();
+        let vectors: Vec<Vec<f32>> = (0..50).map(|i| vec![i as f32, i as f32]).collect();
         let labels: Vec<Vec<u64>> = (0..50).map(|i| vec![i % 3]).collect();
 
         let index = FilteredDiskANN::<DistL2>::build(&vectors, &labels, base_path).unwrap();

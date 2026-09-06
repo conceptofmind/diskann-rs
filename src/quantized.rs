@@ -27,11 +27,11 @@
 //! let results = index.search(&vec![0.0; 64], 10, 64);
 //! ```
 
-use crate::pq::{ProductQuantizer, PQConfig};
+use crate::pq::{PQConfig, ProductQuantizer};
 use crate::rabitq::{RaBitQ, RaBitQQuery};
 use crate::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
-use crate::{beam_search, BeamSearchConfig, GraphIndex, DiskANN, DiskAnnError, DiskAnnParams};
 use crate::Distance;
+use crate::{beam_search, BeamSearchConfig, DiskANN, DiskAnnError, DiskAnnParams, GraphIndex};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -75,11 +75,20 @@ pub(crate) fn quantized_distance_from_codes<D: Distance<f32> + 'static>(
         (QuantizerState::Int8(q), _) => q.asymmetric_distance(query, code),
     };
 
-    if l2 { d.sqrt() } else { d }
+    if l2 {
+        d.sqrt()
+    } else {
+        d
+    }
 }
 
 /// Per-query precomputed state (PQ distance table or RaBitQ query).
-pub(crate) enum Prepared { Table(Vec<f32>), RaBitQ(RaBitQQuery), F16(Vec<numkong::f16>), U8(Vec<u8>) }
+pub(crate) enum Prepared {
+    Table(Vec<f32>),
+    RaBitQ(RaBitQQuery),
+    F16(Vec<numkong::f16>),
+    U8(Vec<u8>),
+}
 
 /// Shared quantized search implementation usable with any `GraphIndex`.
 ///
@@ -101,13 +110,27 @@ fn quantized_search<D: Distance<f32> + 'static>(
 ) -> Vec<(u32, f32)> {
     let prep = quantizer.prepare(query);
 
-    let search_k = if rerank_size > 0 { rerank_size.max(k) } else { k };
+    let search_k = if rerank_size > 0 {
+        rerank_size.max(k)
+    } else {
+        k
+    };
 
     let mut results = beam_search(
         start_ids,
         beam_width,
         search_k,
-        |id| quantized_distance_from_codes(dist, query, id as usize, codes, code_size, quantizer, &prep),
+        |id| {
+            quantized_distance_from_codes(
+                dist,
+                query,
+                id as usize,
+                codes,
+                code_size,
+                quantizer,
+                &prep,
+            )
+        },
         |id| graph.get_neighbors(id),
         &filter_fn,
         config,
@@ -178,7 +201,6 @@ impl QuantizerState {
             QuantizerState::Int8(int8q) => Prepared::U8(int8q.encode(query)),
         }
     }
-
 }
 
 /// Quantized DiskANN index — wraps a `DiskANN<D>` with compressed in-memory codes.
@@ -214,11 +236,7 @@ where
     /// Create from an existing index and a pre-trained ProductQuantizer.
     ///
     /// Encodes all vectors from `base` into the in-memory codes buffer.
-    pub fn from_pq(
-        base: DiskANN<D>,
-        pq: ProductQuantizer,
-        config: QuantizedConfig,
-    ) -> Self {
+    pub fn from_pq(base: DiskANN<D>, pq: ProductQuantizer, config: QuantizedConfig) -> Self {
         let n = base.num_vectors;
         let code_size = pq.stats().code_size_bytes;
         let codes = encode_all_pq(&base, &pq, n);
@@ -262,11 +280,7 @@ where
     }
 
     /// Create from an existing index and a pre-trained Int8Quantizer.
-    pub fn from_int8(
-        base: DiskANN<D>,
-        int8q: Int8Quantizer,
-        config: QuantizedConfig,
-    ) -> Self {
+    pub fn from_int8(base: DiskANN<D>, int8q: Int8Quantizer, config: QuantizedConfig) -> Self {
         let n = base.num_vectors;
         let code_size = int8q.dim();
         let codes = encode_all_generic(&base, &int8q, n, code_size);
@@ -312,12 +326,7 @@ where
     /// Distances in the returned results are:
     /// - If `rerank_size > 0`: exact distances from the base index
     /// - Otherwise: approximate distances from the quantizer
-    pub fn search_with_dists(
-        &self,
-        query: &[f32],
-        k: usize,
-        beam_width: usize,
-    ) -> Vec<(u32, f32)> {
+    pub fn search_with_dists(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<(u32, f32)> {
         assert_eq!(
             query.len(),
             self.base.dim,
@@ -351,12 +360,7 @@ where
     }
 
     /// Batch search (parallel over queries).
-    pub fn search_batch(
-        &self,
-        queries: &[Vec<f32>],
-        k: usize,
-        beam_width: usize,
-    ) -> Vec<Vec<u32>> {
+    pub fn search_batch(&self, queries: &[Vec<f32>], k: usize, beam_width: usize) -> Vec<Vec<u32>> {
         queries
             .par_iter()
             .map(|q| self.search(q, k, beam_width))
@@ -490,13 +494,19 @@ where
     }
 
     /// Deserialize from bytes (base index + quantized data).
-    pub fn from_bytes(bytes: &[u8], dist: D, config: QuantizedConfig) -> Result<Self, DiskAnnError> {
+    pub fn from_bytes(
+        bytes: &[u8],
+        dist: D,
+        config: QuantizedConfig,
+    ) -> Result<Self, DiskAnnError> {
         if bytes.len() < 8 {
             return Err(DiskAnnError::IndexError("Buffer too small".into()));
         }
         let base_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
         if bytes.len() < 8 + base_len {
-            return Err(DiskAnnError::IndexError("Buffer too small for base index".into()));
+            return Err(DiskAnnError::IndexError(
+                "Buffer too small for base index".into(),
+            ));
         }
         let base = DiskANN::from_bytes(bytes[8..8 + base_len].to_vec(), dist)?;
         Self::from_quantized_bytes(base, &bytes[8 + base_len..], config)
@@ -548,7 +558,10 @@ where
         }
         let version = u32_at(4);
         if version != VERSION {
-            return Err(DiskAnnError::IndexError(format!("Unsupported version: {}", version)));
+            return Err(DiskAnnError::IndexError(format!(
+                "Unsupported version: {}",
+                version
+            )));
         }
         let quantizer_type = bytes[8];
         let num_vectors = u64_at(9);
@@ -565,7 +578,8 @@ where
         if bytes.len() < pos + quantizer_data_len {
             return Err(err("Truncated quantizer data"));
         }
-        let quantizer: QuantizerState = bincode::deserialize(&bytes[pos..pos + quantizer_data_len])?;
+        let quantizer: QuantizerState =
+            bincode::deserialize(&bytes[pos..pos + quantizer_data_len])?;
         if quantizer.quantizer_type_id() != quantizer_type {
             return Err(err("Quantizer type mismatch"));
         }
@@ -577,7 +591,13 @@ where
         }
         let codes = bytes[pos..pos + codes_len].to_vec();
 
-        Ok(Self { base, codes, code_size, quantizer, rerank_size: config.rerank_size })
+        Ok(Self {
+            base,
+            codes,
+            code_size,
+            quantizer,
+            rerank_size: config.rerank_size,
+        })
     }
 }
 
@@ -646,11 +666,7 @@ where
 // Encoding helpers — parallel encoding of all vectors
 // ---------------------------------------------------------------------------
 
-fn encode_all_pq<D>(
-    base: &DiskANN<D>,
-    pq: &ProductQuantizer,
-    n: usize,
-) -> Vec<u8>
+fn encode_all_pq<D>(base: &DiskANN<D>, pq: &ProductQuantizer, n: usize) -> Vec<u8>
 where
     D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
 {
@@ -664,12 +680,7 @@ where
     flat
 }
 
-fn encode_all_generic<D, Q>(
-    base: &DiskANN<D>,
-    quantizer: &Q,
-    n: usize,
-    code_size: usize,
-) -> Vec<u8>
+fn encode_all_generic<D, Q>(base: &DiskANN<D>, quantizer: &Q, n: usize, code_size: usize) -> Vec<u8>
 where
     D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
     Q: VectorQuantizer,
@@ -743,7 +754,12 @@ mod tests {
         };
 
         let index = QuantizedDiskANN::<DistL2>::build_pq(
-            &vectors, DistL2 {}, path, ann_params, pq_config, config,
+            &vectors,
+            DistL2 {},
+            path,
+            ann_params,
+            pq_config,
+            config,
         )
         .unwrap();
 
@@ -776,10 +792,9 @@ mod tests {
             alpha: 1.2,
         };
 
-        let index = QuantizedDiskANN::<DistL2>::build_f16(
-            &vectors, DistL2 {}, path, ann_params, config,
-        )
-        .unwrap();
+        let index =
+            QuantizedDiskANN::<DistL2>::build_f16(&vectors, DistL2 {}, path, ann_params, config)
+                .unwrap();
 
         let query = &vectors[0];
         let results = index.search(query, 10, 64);
@@ -810,10 +825,9 @@ mod tests {
             alpha: 1.2,
         };
 
-        let index = QuantizedDiskANN::<DistL2>::build_int8(
-            &vectors, DistL2 {}, path, ann_params, config,
-        )
-        .unwrap();
+        let index =
+            QuantizedDiskANN::<DistL2>::build_int8(&vectors, DistL2 {}, path, ann_params, config)
+                .unwrap();
 
         let query = &vectors[0];
         let results = index.search(query, 10, 64);
@@ -916,7 +930,11 @@ mod tests {
         let config = QuantizedConfig { rerank_size: 10 };
 
         let index = QuantizedDiskANN::<DistL2>::build_f16(
-            &vectors, DistL2 {}, base_path, ann_params, config,
+            &vectors,
+            DistL2 {},
+            base_path,
+            ann_params,
+            config,
         )
         .unwrap();
 
@@ -928,13 +946,8 @@ mod tests {
         index.save_quantized(sidecar_path).unwrap();
 
         // Reload
-        let loaded = QuantizedDiskANN::<DistL2>::open(
-            base_path,
-            sidecar_path,
-            DistL2 {},
-            config,
-        )
-        .unwrap();
+        let loaded =
+            QuantizedDiskANN::<DistL2>::open(base_path, sidecar_path, DistL2 {}, config).unwrap();
 
         assert_eq!(loaded.num_vectors(), index.num_vectors());
         assert_eq!(loaded.dim(), index.dim());
@@ -961,17 +974,15 @@ mod tests {
         };
         let config = QuantizedConfig { rerank_size: 0 };
 
-        let index = QuantizedDiskANN::<DistL2>::build_int8(
-            &vectors, DistL2 {}, path, ann_params, config,
-        )
-        .unwrap();
+        let index =
+            QuantizedDiskANN::<DistL2>::build_int8(&vectors, DistL2 {}, path, ann_params, config)
+                .unwrap();
 
         let query = &vectors[0];
         let res_before = index.search(query, 5, 32);
 
         let bytes = index.to_bytes();
-        let loaded =
-            QuantizedDiskANN::<DistL2>::from_bytes(&bytes, DistL2 {}, config).unwrap();
+        let loaded = QuantizedDiskANN::<DistL2>::from_bytes(&bytes, DistL2 {}, config).unwrap();
 
         assert_eq!(loaded.num_vectors(), index.num_vectors());
         let res_after = loaded.search(query, 5, 32);
@@ -1002,7 +1013,12 @@ mod tests {
         };
 
         let index = QuantizedDiskANN::<DistL2>::build_pq(
-            &vectors, DistL2 {}, path, ann_params, pq_config, config,
+            &vectors,
+            DistL2 {},
+            path,
+            ann_params,
+            pq_config,
+            config,
         )
         .unwrap();
 
@@ -1043,10 +1059,9 @@ mod tests {
             alpha: 1.2,
         };
 
-        let index = QuantizedDiskANN::<DistL2>::build_f16(
-            &vectors, DistL2 {}, path, ann_params, config,
-        )
-        .unwrap();
+        let index =
+            QuantizedDiskANN::<DistL2>::build_f16(&vectors, DistL2 {}, path, ann_params, config)
+                .unwrap();
 
         let query = &vectors[0];
         let results = index.search_with_dists(query, 5, 32);

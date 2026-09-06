@@ -176,10 +176,7 @@ mod tests {
     #[test]
     fn test_ivecs_round_trip() {
         let path = "test_ivecs_rt.ivecs";
-        let vectors = vec![
-            vec![10i32, 20, 30],
-            vec![40, 50, 60],
-        ];
+        let vectors = vec![vec![10i32, 20, 30], vec![40, 50, 60]];
 
         write_ivecs(path, &vectors).unwrap();
         let loaded = read_ivecs(path).unwrap();
@@ -191,10 +188,7 @@ mod tests {
     #[test]
     fn test_bvecs_round_trip() {
         let path = "test_bvecs_rt.bvecs";
-        let vectors = vec![
-            vec![0u8, 128, 255],
-            vec![1, 2, 3],
-        ];
+        let vectors = vec![vec![0u8, 128, 255], vec![1, 2, 3]];
 
         write_bvecs(path, &vectors).unwrap();
         let loaded = read_bvecs(path).unwrap();
@@ -206,9 +200,7 @@ mod tests {
     #[test]
     fn test_bvecs_as_f32() {
         let path = "test_bvecs_f32.bvecs";
-        let vectors = vec![
-            vec![0u8, 255],
-        ];
+        let vectors = vec![vec![0u8, 255]];
 
         write_bvecs(path, &vectors).unwrap();
         let loaded = read_bvecs_as_f32(path).unwrap();
@@ -235,10 +227,7 @@ mod tests {
     fn test_fvecs_varying_would_fail() {
         // fvecs format allows varying dims per vector (each has its own dim header)
         let path = "test_fvecs_vary.fvecs";
-        let vectors = vec![
-            vec![1.0f32, 2.0],
-            vec![3.0, 4.0, 5.0],
-        ];
+        let vectors = vec![vec![1.0f32, 2.0], vec![3.0, 4.0, 5.0]];
 
         write_fvecs(path, &vectors).unwrap();
         let loaded = read_fvecs(path).unwrap();
