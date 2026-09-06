@@ -473,10 +473,14 @@ where
                 self.free_posting(b)?;
                 for (id, code) in entries {
                     let v = self.raw(id).to_vec();
-                    let t = self.nearest(&v, 1).first().map(|t| t.0).unwrap_or_else(|| *self.cid_block.values().next().unwrap());
+                    let t = self.nearest(&v, 1)
+                        .first()
+                        .map(|t| t.0)
+                        .unwrap_or_else(|| *self.cid_block.values().next().unwrap());
                     self.push(t, id, &code);
                     if self.len(t) >= self.cfg.max_posting_size {
                         queue.push(t);
+                        self.drain(&mut queue)?;
                     }
                 }
             } else if entries.len() != self.len(b) {
