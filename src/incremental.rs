@@ -297,43 +297,9 @@ impl DeltaLayer {
         candidates: &[(u32, f32)],
         dist: D,
     ) -> Vec<u32> {
-        if candidates.is_empty() {
-            return Vec::new();
-        }
-
-        let alpha = 1.2f32;
-        let mut sorted = candidates.to_vec();
-        sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-        let mut pruned = Vec::new();
-
-        for &(cand_id, cand_dist) in &sorted {
-            if cand_id as usize == node_idx {
-                continue;
-            }
-            let occluded = pruned.iter().any(|&sel| {
-                alpha * dist.eval(&self.vectors[cand_id as usize], &self.vectors[sel as usize])
-                    < cand_dist
-            });
-            if !occluded {
-                pruned.push(cand_id);
-                if pruned.len() >= self.max_degree {
-                    break;
-                }
-            }
-        }
-
-        for &(cand_id, _) in &sorted {
-            if pruned.len() >= self.max_degree {
-                break;
-            }
-            if cand_id as usize == node_idx || pruned.contains(&cand_id) {
-                continue;
-            }
-            pruned.push(cand_id);
-        }
-
-        pruned
+        crate::robust_prune(node_idx as u32, candidates, self.max_degree, 1.2, |a, b| {
+            dist.eval(&self.vectors[a as usize], &self.vectors[b as usize])
+        })
     }
 
     fn search<D: Distance<f32> + Copy>(

@@ -715,6 +715,7 @@ where
             inner.new_posting(v.clone())?;
         }
         inner.insert(vectors)?;
+        inner.compact()?;
         let s = Self {
             inner: RwLock::new(inner),
         };

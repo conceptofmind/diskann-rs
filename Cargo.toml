@@ -54,3 +54,6 @@ required-features = ["hdf5"]
 [[example]]
 name = "diskann_mnist"
 required-features = ["hdf5"]
+[[bench]]
+name = "spfresh"
+harness = false

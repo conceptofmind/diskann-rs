@@ -972,7 +972,67 @@ fn greedy_search<D: Distance<f32> + Copy>(
     v.into_iter().map(|c| (c.id, c.dist)).collect()
 }
 
-/// α-pruning from DiskANN/Vamana
+/// RobustPrune (Vamana): strict RNG pass at α=1, then relaxed passes up to `alpha`
+/// (as in Microsoft DiskANN's `occlude_list`), then backfill with the closest.
+pub(crate) fn robust_prune(
+    node_id: u32,
+    candidates: &[(u32, f32)],
+    max_degree: usize,
+    alpha: f32,
+    dist: impl Fn(u32, u32) -> f32,
+) -> Vec<u32> {
+    let mut sorted: Vec<(u32, f32)> = candidates
+        .iter()
+        .copied()
+        .filter(|c| c.0 != node_id)
+        .collect();
+    sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+    sorted.dedup_by_key(|c| c.0);
+    let n = sorted.len();
+    let alpha = alpha.max(1.0);
+
+    let mut occlude = vec![0.0f32; n];
+    let mut selected = vec![false; n];
+    let mut pruned = Vec::with_capacity(max_degree.min(n));
+    let mut cur_alpha = 1.0f32;
+    while cur_alpha <= alpha && pruned.len() < max_degree {
+        for i in 0..n {
+            if pruned.len() >= max_degree {
+                break;
+            }
+            if selected[i] || occlude[i] > cur_alpha {
+                continue;
+            }
+            selected[i] = true;
+            pruned.push(sorted[i].0);
+            for j in i + 1..n {
+                if selected[j] || occlude[j] > alpha {
+                    continue;
+                }
+                let djk = dist(sorted[j].0, sorted[i].0);
+                occlude[j] = if djk == 0.0 {
+                    f32::INFINITY
+                } else {
+                    occlude[j].max(sorted[j].1 / djk)
+                };
+            }
+        }
+        cur_alpha *= 1.2;
+    }
+
+    for i in 0..n {
+        if pruned.len() >= max_degree {
+            break;
+        }
+        if !selected[i] {
+            selected[i] = true;
+            pruned.push(sorted[i].0);
+        }
+    }
+
+    pruned
+}
+
 fn prune_neighbors<D: Distance<f32> + Copy>(
     node_id: usize,
     candidates: &[(u32, f32)],
@@ -981,41 +1041,9 @@ fn prune_neighbors<D: Distance<f32> + Copy>(
     alpha: f32,
     dist: D,
 ) -> Vec<u32> {
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-
-    let mut sorted = candidates.to_vec();
-    sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
-
-    let mut pruned = Vec::<u32>::new();
-
-    for &(cand_id, cand_dist) in &sorted {
-        if cand_id as usize == node_id {
-            continue;
-        }
-        let occluded = pruned.iter().any(|&sel| {
-            alpha * dist.eval(&vectors[cand_id as usize], &vectors[sel as usize]) < cand_dist
-        });
-        if !occluded {
-            pruned.push(cand_id);
-            if pruned.len() >= max_degree {
-                break;
-            }
-        }
-    }
-
-    for &(cand_id, _) in &sorted {
-        if pruned.len() >= max_degree {
-            break;
-        }
-        if cand_id as usize == node_id || pruned.contains(&cand_id) {
-            continue;
-        }
-        pruned.push(cand_id);
-    }
-
-    pruned
+    robust_prune(node_id as u32, candidates, max_degree, alpha, |a, b| {
+        dist.eval(&vectors[a as usize], &vectors[b as usize])
+    })
 }
 
 fn build_incoming_csr(order: &[usize], new_graph: &[Vec<u32>], n: usize) -> (Vec<u32>, Vec<usize>) {
