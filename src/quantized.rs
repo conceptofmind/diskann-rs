@@ -35,7 +35,7 @@ use crate::Distance;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 
 /// Compute quantized distance for a single candidate from flat code buffer.
 #[inline]
@@ -473,10 +473,8 @@ where
         config: QuantizedConfig,
     ) -> Result<Self, DiskAnnError> {
         let base = DiskANN::open_index_with(base_path, dist)?;
-        let mut file = File::open(quantized_path)?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Self::from_quantized_bytes(&base, &bytes, config)
+        let bytes = std::fs::read(quantized_path)?;
+        Self::from_quantized_bytes(base, &bytes, config)
     }
 
     /// Serialize the quantizer + codes to bytes (without the base index).
@@ -492,11 +490,7 @@ where
     }
 
     /// Deserialize from bytes (base index + quantized data).
-    pub fn from_bytes(
-        bytes: &[u8],
-        dist: D,
-        config: QuantizedConfig,
-    ) -> Result<Self, DiskAnnError> {
+    pub fn from_bytes(bytes: &[u8], dist: D, config: QuantizedConfig) -> Result<Self, DiskAnnError> {
         if bytes.len() < 8 {
             return Err(DiskAnnError::IndexError("Buffer too small".into()));
         }
@@ -504,11 +498,8 @@ where
         if bytes.len() < 8 + base_len {
             return Err(DiskAnnError::IndexError("Buffer too small for base index".into()));
         }
-        let base_bytes = bytes[8..8 + base_len].to_vec();
-        let quantized_bytes = &bytes[8 + base_len..];
-
-        let base = DiskANN::from_bytes(base_bytes, dist)?;
-        Self::from_quantized_bytes(&base, quantized_bytes, config)
+        let base = DiskANN::from_bytes(bytes[8..8 + base_len].to_vec(), dist)?;
+        Self::from_quantized_bytes(base, &bytes[8 + base_len..], config)
     }
 
     // -----------------------------------------------------------------------
@@ -537,72 +528,56 @@ where
     }
 
     fn from_quantized_bytes(
-        base: &DiskANN<D>,
+        base: DiskANN<D>,
         bytes: &[u8],
         config: QuantizedConfig,
     ) -> Result<Self, DiskAnnError> {
-        let header_size = 4 + 4 + 1 + 8 + 8 + 8;
-        if bytes.len() < header_size {
-            return Err(DiskAnnError::IndexError("Quantized data too small".into()));
+        let err = |m: &str| DiskAnnError::IndexError(m.into());
+        if bytes.len() < 33 {
+            return Err(err("Quantized data too small"));
         }
+        let u32_at = |p: usize| u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap());
+        let u64_at = |p: usize| u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap()) as usize;
 
-        let mut pos = 0;
-
-        let magic = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-        pos += 4;
+        let magic = u32_at(0);
         if magic != MAGIC {
             return Err(DiskAnnError::IndexError(format!(
                 "Invalid magic: expected 0x{:08X}, got 0x{:08X}",
                 MAGIC, magic
             )));
         }
-
-        let version = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-        pos += 4;
+        let version = u32_at(4);
         if version != VERSION {
+            return Err(DiskAnnError::IndexError(format!("Unsupported version: {}", version)));
+        }
+        let quantizer_type = bytes[8];
+        let num_vectors = u64_at(9);
+        let code_size = u64_at(17);
+        let quantizer_data_len = u64_at(25);
+        let mut pos = 33;
+
+        if num_vectors != base.num_vectors {
             return Err(DiskAnnError::IndexError(format!(
-                "Unsupported version: {}",
-                version
+                "Sidecar has {} vectors, base index has {}",
+                num_vectors, base.num_vectors
             )));
         }
-
-        let _quantizer_type = bytes[pos];
-        pos += 1;
-
-        let num_vectors = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-
-        let code_size = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-
-        let quantizer_data_len =
-            u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-
         if bytes.len() < pos + quantizer_data_len {
-            return Err(DiskAnnError::IndexError("Truncated quantizer data".into()));
+            return Err(err("Truncated quantizer data"));
         }
-        let quantizer: QuantizerState =
-            bincode::deserialize(&bytes[pos..pos + quantizer_data_len])?;
+        let quantizer: QuantizerState = bincode::deserialize(&bytes[pos..pos + quantizer_data_len])?;
+        if quantizer.quantizer_type_id() != quantizer_type {
+            return Err(err("Quantizer type mismatch"));
+        }
         pos += quantizer_data_len;
 
         let codes_len = num_vectors * code_size;
         if bytes.len() < pos + codes_len {
-            return Err(DiskAnnError::IndexError("Truncated codes data".into()));
+            return Err(err("Truncated codes data"));
         }
         let codes = bytes[pos..pos + codes_len].to_vec();
 
-        // Clone the base index data — we need ownership
-        let base_bytes = base.to_bytes();
-        let owned_base = DiskANN::from_bytes(base_bytes, base.dist)?;
-
-        Ok(Self {
-            base: owned_base,
-            codes,
-            code_size,
-            quantizer,
-            rerank_size: config.rerank_size,
-        })
+        Ok(Self { base, codes, code_size, quantizer, rerank_size: config.rerank_size })
     }
 }
 
