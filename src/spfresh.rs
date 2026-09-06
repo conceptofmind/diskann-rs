@@ -282,7 +282,7 @@ where
 
     fn code_dist(&self, query: &[f32], code: &[u8], prep: &Option<Prepared>) -> f32 {
         match (&self.quantizer, prep) {
-            (Some(q), Some(p)) => quantized_distance_from_codes(query, 0, code, self.code_size, q, p),
+            (Some(q), Some(p)) => quantized_distance_from_codes(&self.dist, query, 0, code, self.code_size, q, p),
             _ => self.dist.eval(query, bytemuck::cast_slice(code)),
         }
     }

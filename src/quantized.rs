@@ -39,7 +39,8 @@ use std::io::{Read, Write};
 
 /// Compute quantized distance for a single candidate from flat code buffer.
 #[inline]
-pub(crate) fn quantized_distance_from_codes(
+pub(crate) fn quantized_distance_from_codes<D: Distance<f32> + 'static>(
+    dist: &D,
     query: &[f32],
     idx: usize,
     codes: &[u8],
@@ -47,18 +48,34 @@ pub(crate) fn quantized_distance_from_codes(
     quantizer: &QuantizerState,
     prep: &Prepared,
 ) -> f32 {
-    let code_start = idx * code_size;
-    let code = &codes[code_start..code_start + code_size];
-    match (quantizer, prep) {
-        (QuantizerState::PQ(pq), Prepared::Table(table)) => pq.distance_with_table(table, code),
-        (QuantizerState::PQ(pq), _) => pq.asymmetric_distance(query, code),
-        (QuantizerState::RaBitQ(rq), Prepared::RaBitQ(q)) => rq.distance(q, code),
-        (QuantizerState::RaBitQ(rq), _) => rq.asymmetric_distance(query, code),
-        (QuantizerState::F16(f16q), Prepared::F16(q)) => f16q.distance_f16(q, code),
-        (QuantizerState::Int8(int8q), Prepared::U8(q)) => int8q.distance_u8(q, code),
-        (QuantizerState::F16(f16q), _) => f16q.asymmetric_distance(query, code),
-        (QuantizerState::Int8(int8q), _) => int8q.asymmetric_distance(query, code),
+    use std::any::TypeId;
+
+    let start = idx * code_size;
+    let code = &codes[start..start + code_size];
+    let l2 = TypeId::of::<D>() == TypeId::of::<crate::DistL2>();
+
+    if !l2 && TypeId::of::<D>() != TypeId::of::<crate::DistL2Sq>() {
+        let decoded = match quantizer {
+            QuantizerState::PQ(q) => q.decode(code),
+            QuantizerState::F16(q) => q.decode(code),
+            QuantizerState::Int8(q) => q.decode(code),
+            QuantizerState::RaBitQ(q) => q.decode(code),
+        };
+        return dist.eval(query, &decoded);
     }
+
+    let d = match (quantizer, prep) {
+        (QuantizerState::PQ(q), Prepared::Table(t)) => q.distance_with_table(t, code),
+        (QuantizerState::PQ(q), _) => q.asymmetric_distance(query, code),
+        (QuantizerState::RaBitQ(q), Prepared::RaBitQ(p)) => q.distance(p, code),
+        (QuantizerState::RaBitQ(q), _) => q.asymmetric_distance(query, code),
+        (QuantizerState::F16(q), Prepared::F16(p)) => q.distance_f16(p, code),
+        (QuantizerState::Int8(q), Prepared::U8(p)) => q.distance_u8(p, code),
+        (QuantizerState::F16(q), _) => q.asymmetric_distance(query, code),
+        (QuantizerState::Int8(q), _) => q.asymmetric_distance(query, code),
+    };
+
+    if l2 { d.sqrt() } else { d }
 }
 
 /// Per-query precomputed state (PQ distance table or RaBitQ query).
@@ -70,6 +87,7 @@ pub(crate) enum Prepared { Table(Vec<f32>), RaBitQ(RaBitQQuery), F16(Vec<numkong
 /// using exact distances from the graph and optional label-based filtering.
 pub(crate) fn quantized_search(
     graph: &dyn GraphIndex,
+    dist: &D,
     codes: &[u8],
     code_size: usize,
     quantizer: &QuantizerState,
@@ -89,7 +107,7 @@ pub(crate) fn quantized_search(
         start_ids,
         beam_width,
         search_k,
-        |id| quantized_distance_from_codes(query, id as usize, codes, code_size, quantizer, &prep),
+        |id| quantized_distance_from_codes(dist, query, id as usize, codes, code_size, quantizer, &prep),
         |id| graph.get_neighbors(id),
         &filter_fn,
         config,
@@ -310,6 +328,7 @@ where
 
         quantized_search(
             &self.base,
+            &self.base.dist,
             &self.codes,
             self.code_size,
             &self.quantizer,
@@ -385,6 +404,7 @@ where
 
         quantized_search(
             &self.base,
+            &self.base.dist,
             &self.codes,
             self.code_size,
             &self.quantizer,

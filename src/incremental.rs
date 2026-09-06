@@ -1016,6 +1016,7 @@ where
                     if id_usize < base_count {
                         // Use quantized distance for base vectors
                         quantized_distance_from_codes(
+                            &self.dist,
                             query, id_usize, base_codes, code_size, quantizer, &prep,
                         )
                     } else {
