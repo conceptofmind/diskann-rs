@@ -16,6 +16,8 @@ use std::fs::{File, OpenOptions};
 use std::sync::RwLock;
 
 const FREE: u64 = u64::MAX;
+/// Below this many live postings, `nearest` scans centroids instead of searching the graph.
+const BRUTE_FORCE_CENTROIDS: usize = 4096;
 const CHUNK: usize = 4096;
 /// Raw vectors per object in a snapshot.
 pub const RAW_CHUNK: usize = 4096;
@@ -352,7 +354,22 @@ where
     }
 
     /// Nearest live postings as `(block, centroid distance)`, closest first.
+    /// Small centroid sets are scanned exactly; larger ones go through the graph.
     fn nearest(&self, v: &[f32], n: usize) -> Vec<(u32, f32)> {
+        if self.cid_block.len() <= BRUTE_FORCE_CENTROIDS {
+            let mut all: Vec<(u32, f32)> = self
+                .cid_block
+                .values()
+                .map(|&b| (b, self.dist.eval(v, &self.block_centroid[b as usize])))
+                .collect();
+            let n = n.min(all.len());
+            if n < all.len() {
+                all.select_nth_unstable_by(n, |a, b| a.1.total_cmp(&b.1));
+                all.truncate(n);
+            }
+            all.sort_by(|a, b| a.1.total_cmp(&b.1));
+            return all;
+        }
         self.graph
             .search_with_dists(v, n, self.cfg.centroid_beam.max(n))
             .into_iter()
@@ -454,7 +471,46 @@ where
                 self.compact()?;
             }
         }
+        self.compact_if_dirty()?;
         Ok(ids)
+    }
+
+    /// Rebuild the centroid graph if any posting was created or freed since the
+    /// last rebuild, so routing never depends on the delta layer between calls.
+    fn compact_if_dirty(&mut self) -> Result<(), DiskAnnError> {
+        let s = self.graph.stats();
+        if s.delta_vectors + s.tombstones > 0 {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Entries of `p` that are closer to one of `cands` than to `p`'s own centroid.
+    fn local_moves(&self, p: u32, cands: &[u32]) -> Vec<(u64, u32)> {
+        let cp = &self.block_centroid[p as usize];
+        self.live_entries(p)
+            .iter()
+            .filter_map(|(id, _)| {
+                let v = self.raw(*id);
+                let dp = self.dist.eval(v, cp);
+                cands
+                    .iter()
+                    .filter(|&&t| t != p && self.is_live(t))
+                    .map(|&t| (t, self.dist.eval(v, &self.block_centroid[t as usize])))
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .filter(|&(_, d)| d < dp)
+                    .map(|(t, _)| (*id, t))
+            })
+            .collect()
+    }
+
+    /// Live postings around `p`'s centroid (including `p`).
+    fn neighbourhood(&self, p: u32) -> Vec<u32> {
+        let c = self.block_centroid[p as usize].clone();
+        self.nearest(&c, self.cfg.reassign_neighbors + 2)
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect()
     }
 
     fn drain(&mut self, queue: &mut Vec<u32>) -> Result<(), DiskAnnError> {
@@ -465,16 +521,7 @@ where
             if self.len(b) >= self.cfg.max_posting_size {
                 self.split(b, queue)?;
             } else {
-                let moves: Vec<_> = self
-                    .live_entries(b)
-                    .into_iter()
-                    .filter_map(|(id, _)| {
-                        let v = self.raw(id);
-                        let &(t, d) = self.nearest(v, 1).first()?;
-                        (t != b && d < self.dist.eval(v, &self.block_centroid[b as usize]))
-                            .then_some((id, t))
-                    })
-                    .collect();
+                let moves = self.local_moves(b, &self.neighbourhood(b));
                 self.relocate(b, &moves, queue)?;
             }
         }
@@ -539,43 +586,21 @@ where
             };
             self.push(t, *id, code);
         }
-        // NPA for the split vectors: move to a closer centroid elsewhere.
+        // NPA (SPFresh): vectors of the two new postings may belong to a nearby
+        // centroid, and vectors of nearby postings may now belong to a new one.
+        let mut around: Vec<u32> = nb.iter().flat_map(|&p| self.neighbourhood(p)).collect();
+        around.sort_unstable();
+        around.dedup();
         for &p in &nb {
-            let moves: Vec<(u64, u32)> = self
-                .live_entries(p)
-                .iter()
-                .filter_map(|(id, _)| {
-                    let v = self.raw(*id);
-                    let &(t, d) = self.nearest(v, 1).first()?;
-                    (t != p && d < self.dist.eval(v, &self.block_centroid[p as usize]))
-                        .then_some((*id, t))
-                })
-                .collect();
+            let moves = self.local_moves(p, &around);
             self.relocate(p, &moves, queue)?;
         }
-        // NPA for neighbouring postings: pull vectors now closer to a new centroid.
-        let mut seen: HashSet<u32> = nb.iter().copied().collect();
-        for &p in &nb {
-            let c = self.block_centroid[p as usize].clone();
-            for (q, _) in self.nearest(&c, self.cfg.reassign_neighbors + 2) {
-                if !seen.insert(q) {
-                    continue;
-                }
-                let moves: Vec<(u64, u32)> = self
-                    .live_entries(q)
-                    .iter()
-                    .filter_map(|(id, _)| {
-                        let v = self.raw(*id);
-                        let dq = self.dist.eval(v, &self.block_centroid[q as usize]);
-                        let (t, d) = nb
-                            .iter()
-                            .map(|&t| (t, self.dist.eval(v, &self.block_centroid[t as usize])))
-                            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))?;
-                        (d < dq).then_some((*id, t))
-                    })
-                    .collect();
-                self.relocate(q, &moves, queue)?;
+        for &q in &around {
+            if nb.contains(&q) || !self.is_live(q) {
+                continue;
             }
+            let moves = self.local_moves(q, &nb);
+            self.relocate(q, &moves, queue)?;
         }
         for &p in &nb {
             if self.len(p) >= self.cfg.max_posting_size {
@@ -614,10 +639,7 @@ where
             }
         }
         self.drain(&mut queue)?;
-        if self.graph.should_compact() {
-            self.compact()?;
-        }
-        Ok(())
+        self.compact_if_dirty()
     }
 
     fn compact(&mut self) -> Result<(), DiskAnnError> {
@@ -787,7 +809,6 @@ where
             inner.new_posting(v.clone())?;
         }
         inner.insert(vectors)?;
-        inner.compact()?;
         let s = Self {
             inner: RwLock::new(inner),
         };

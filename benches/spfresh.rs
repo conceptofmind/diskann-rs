@@ -3,7 +3,7 @@
 //! plain DiskANN reference.
 //!
 //! Run: cargo bench --bench spfresh
-//! Env: SPF_N (default 100000), SPF_DIM (128), SPF_Q (500)
+//! Env: SPF_N (default 100000), SPF_DIM (128), SPF_Q (500), SPF_ONLY (raw|f16|int8|rabitq|diskann)
 
 use diskann_rs::{DiskANN, DistL2, QuantizerKind, SPFresh, SPFreshConfig};
 use rand::prelude::*;
@@ -150,9 +150,21 @@ fn main() {
     let queries = clustered(q, dim, 2);
     let n_build = n * 6 / 10;
 
-    run_variant("raw", None, 0, &data, &queries, n_build);
-    run_variant("f16", Some(QuantizerKind::F16), 0, &data, &queries, n_build);
-    run_variant("int8_rerank", Some(QuantizerKind::Int8), 50, &data, &queries, n_build);
-    run_variant("rabitq_rerank", Some(QuantizerKind::RaBitQ), 100, &data, &queries, n_build);
-    diskann_reference(&data, &queries);
+    let only = std::env::var("SPF_ONLY").ok();
+    let want = |name: &str| only.as_deref().map_or(true, |o| o == name);
+    if want("raw") {
+        run_variant("raw", None, 0, &data, &queries, n_build);
+    }
+    if want("f16") {
+        run_variant("f16", Some(QuantizerKind::F16), 0, &data, &queries, n_build);
+    }
+    if want("int8") {
+        run_variant("int8_rerank", Some(QuantizerKind::Int8), 50, &data, &queries, n_build);
+    }
+    if want("rabitq") {
+        run_variant("rabitq_rerank", Some(QuantizerKind::RaBitQ), 100, &data, &queries, n_build);
+    }
+    if want("diskann") {
+        diskann_reference(&data, &queries);
+    }
 }
