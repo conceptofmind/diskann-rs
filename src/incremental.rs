@@ -122,36 +122,44 @@ impl DeltaLayer {
 
         for (i, v) in vectors.iter().enumerate() {
             let local_idx = start_idx + i;
-            // Global ID: base_offset + local_idx (we use u64::MAX/2 as delta offset)
-            let global_id = DELTA_ID_OFFSET + local_idx as u64;
-            new_ids.push(global_id);
+            new_ids.push(DELTA_ID_OFFSET + local_idx as u64);
 
             self.vectors.push(v.clone());
             self.graph.push(Vec::new());
 
-            // Connect to existing delta vectors using greedy search + prune
             if local_idx > 0 {
                 let neighbors = self.find_and_prune_neighbors(local_idx, dist);
                 self.graph[local_idx] = neighbors.clone();
 
-                // Reverse edges (make graph bidirectional-ish)
                 for &nb in &neighbors {
                     let nb_idx = nb as usize;
-                    if !self.graph[nb_idx].contains(&(local_idx as u32))
-                        && self.graph[nb_idx].len() < self.max_degree
-                    {
+                    if self.graph[nb_idx].contains(&(local_idx as u32)) {
+                        continue;
+                    }
+                    if self.graph[nb_idx].len() < self.max_degree {
                         self.graph[nb_idx].push(local_idx as u32);
+                    } else {
+                        let pool: Vec<(u32, f32)> = self.graph[nb_idx]
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(local_idx as u32))
+                            .map(|c| {
+                                (
+                                    c,
+                                    dist.eval(&self.vectors[nb_idx], &self.vectors[c as usize]),
+                                )
+                            })
+                            .collect();
+                        self.graph[nb_idx] = self.prune_neighbors(nb_idx, &pool, dist);
                     }
                 }
             }
 
-            // Update entry point to be closest to centroid (simplified: just use first)
             if self.entry_point.is_none() {
                 self.entry_point = Some(0);
             }
         }
 
-        // Recompute entry point as approximate medoid
         if self.vectors.len() > 1 {
             self.entry_point = Some(self.compute_medoid(dist));
         }
