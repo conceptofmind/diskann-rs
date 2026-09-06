@@ -85,7 +85,7 @@ pub(crate) enum Prepared { Table(Vec<f32>), RaBitQ(RaBitQQuery), F16(Vec<numkong
 ///
 /// Performs beam search using quantized distances, with optional re-ranking
 /// using exact distances from the graph and optional label-based filtering.
-pub(crate) fn quantized_search(
+fn quantized_search<D: Distance<f32> + 'static>(
     graph: &dyn GraphIndex,
     dist: &D,
     codes: &[u8],

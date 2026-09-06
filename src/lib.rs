@@ -1038,7 +1038,7 @@ fn prune_neighbors<D: Distance<f32> + Copy>(
     }
 
     let mut sorted = candidates.to_vec();
-    sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
 
     let mut pruned = Vec::<u32>::new();
 
@@ -1046,15 +1046,10 @@ fn prune_neighbors<D: Distance<f32> + Copy>(
         if cand_id as usize == node_id {
             continue;
         }
-        let mut ok = true;
-        for &sel in &pruned {
-            let d = dist.eval(&vectors[cand_id as usize], &vectors[sel as usize]);
-            if d < alpha * cand_dist {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
+        let occluded = pruned.iter().any(|&sel| {
+            alpha * dist.eval(&vectors[cand_id as usize], &vectors[sel as usize]) < cand_dist
+        });
+        if !occluded {
             pruned.push(cand_id);
             if pruned.len() >= max_degree {
                 break;
@@ -1062,17 +1057,14 @@ fn prune_neighbors<D: Distance<f32> + Copy>(
         }
     }
 
-    // fill with closest if still not full
     for &(cand_id, _) in &sorted {
         if pruned.len() >= max_degree {
             break;
         }
-        if cand_id as usize == node_id {
+        if cand_id as usize == node_id || pruned.contains(&cand_id) {
             continue;
         }
-        if !pruned.contains(&cand_id) {
-            pruned.push(cand_id);
-        }
+        pruned.push(cand_id);
     }
 
     pruned
