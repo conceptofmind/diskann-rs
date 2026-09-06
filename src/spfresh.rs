@@ -330,10 +330,16 @@ where
 
     fn insert(&mut self, vectors: &[Vec<f32>]) -> Result<Vec<u64>, DiskAnnError> {
         if let Some(v) = vectors.iter().find(|v| v.len() != self.dim) {
-            return Err(DiskAnnError::IndexError(format!("Vector dim {} != index dim {}", v.len(), self.dim)));
+            return Err(DiskAnnError::IndexError(format!(
+                "Vector dim {} != index dim {}", v.len(), self.dim
+            )));
         }
         let ids: Vec<u64> = (self.next_id..self.next_id + vectors.len() as u64).collect();
-        grow(&self.raw_file, &mut self.raw, (self.next_id as usize + vectors.len()) * self.dim * 4)?;
+        grow(
+            &self.raw_file,
+            &mut self.raw,
+            (self.next_id as usize + vectors.len()) * self.dim * 4,
+        )?;
         for (&id, v) in ids.iter().zip(vectors) {
             let o = id as usize * self.dim * 4;
             self.raw[o..o + self.dim * 4].copy_from_slice(bytemuck::cast_slice(v));
@@ -345,10 +351,15 @@ where
             self.epoch += 1;
             self.created.clear();
             let me = &*self;
-            let targets: Vec<Option<u32>> = chunk.par_iter().map(|v| me.nearest(v, 1).first().map(|t| t.0)).collect();
+            let targets: Vec<Option<u32>> = chunk
+                .par_iter()
+                .map(|v| me.nearest(v, 1).first().map(|t| t.0))
+                .collect();
             for ((&id, v), t) in chunk_ids.iter().zip(chunk).zip(targets) {
-                // Exact nearest = precomputed target (if still live) vs. centroids created since.
-                let mut best = t.filter(|&b| self.is_live(b)).map(|b| (b, self.dist.eval(v, &self.block_centroid[b as usize])));
+                let mut best = t
+                    .filter(|&b| self.is_live(b))
+                    .map(|b| (b, self.dist.eval(v, &self.block_centroid[b as usize])))
+                    .or_else(|| self.nearest(v, 1).first().copied());
                 for i in 0..self.created.len() {
                     let c = self.created[i];
                     if self.is_live(c) {
@@ -360,10 +371,7 @@ where
                 }
                 let b = match best {
                     Some((b, _)) => b,
-                    None => match self.nearest(v, 1).first() {
-                        Some(&(b, _)) => b,
-                        None => self.new_posting(v.clone())?,
-                    },
+                    None => self.new_posting(v.clone())?,
                 };
                 let code = self.encode(v);
                 self.push(b, id, &code);
@@ -378,23 +386,56 @@ where
 
     fn drain(&mut self, queue: &mut Vec<u32>) -> Result<(), DiskAnnError> {
         while let Some(b) = queue.pop() {
-            if self.is_live(b) && self.len(b) >= self.cfg.max_posting_size {
+            if !self.is_live(b) {
+                continue;
+            }
+            if self.len(b) >= self.cfg.max_posting_size {
                 self.split(b, queue)?;
+            } else {
+                let moves: Vec<_> = self
+                    .live_entries(b)
+                    .into_iter()
+                    .filter_map(|(id, _)| {
+                        let v = self.raw(id);
+                        let &(t, d) = self.nearest(v, 1).first()?;
+                        (t != b && d < self.dist.eval(v, &self.block_centroid[b as usize]))
+                            .then_some((id, t))
+                    })
+                    .collect();
+                self.relocate(b, &moves, queue)?;
             }
         }
         Ok(())
     }
 
     /// Move `(id, target)` entries out of `from`; targets at capacity keep the entry in place.
-    fn relocate(&mut self, from: u32, moves: &[(u64, u32)], queue: &mut Vec<u32>) -> Result<(), DiskAnnError> {
+    fn relocate(
+        &mut self,
+        from: u32,
+        moves: &[(u64, u32)],
+        queue: &mut Vec<u32>,
+    ) -> Result<(), DiskAnnError> {
         if moves.is_empty() {
             return Ok(());
         }
-        let (moved, keep): (Vec<_>, Vec<_>) = self.live_entries(from).into_iter().partition(|(id, _)| moves.iter().any(|m| m.0 == *id));
+        let (moved, keep): (Vec<_>, Vec<_>) = self
+            .live_entries(from)
+            .into_iter()
+            .partition(|(id, _)| moves.iter().any(|m| m.0 == *id));
         self.rewrite(from, &keep);
         for (id, code) in moved {
             let t = moves.iter().find(|m| m.0 == id).unwrap().1;
-            let t = if self.is_live(t) && self.len(t) < 2 * self.cfg.max_posting_size { t } else { from };
+            let t = if self.is_live(t) && self.len(t) < 2 * self.cfg.max_posting_size {
+                t
+            } else {
+                if !queue.contains(&from) {
+                    queue.insert(0, from);
+                }
+                if self.is_live(t) {
+                    queue.push(t);
+                }
+                from
+            };
             self.push(t, id, &code);
             if self.len(t) >= self.cfg.max_posting_size {
                 queue.push(t);
@@ -402,7 +443,7 @@ where
         }
         Ok(())
     }
-
+    
     fn split(&mut self, b: u32, queue: &mut Vec<u32>) -> Result<(), DiskAnnError> {
         let entries = self.live_entries(b);
         if entries.len() < 2 {
