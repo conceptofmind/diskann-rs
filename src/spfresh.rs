@@ -1,26 +1,3 @@
-//! # SPFresh — partition index with in-place updates (LIRE)
-//!
-//! SPANN layout: centroids live in an [`IncrementalDiskANN`] graph, vectors in
-//! fixed-capacity posting blocks of a memory-mapped file. Each entry is
-//! `(id, code)` where `code` is the quantized vector (F16 / Int8 / PQ / RaBitQ)
-//! or raw f32. Raw vectors are kept in a second memory-mapped file for
-//! re-ranking, splitting and reassignment.
-//!
-//! Updates follow SPFresh (Xu et al., SOSP'23): an insert appends to the
-//! nearest posting; a posting reaching `max_posting_size` is split with
-//! 2-means, and vectors of the split posting and of neighbouring postings are
-//! reassigned to their nearest centroid (NPA). Deletes are tombstones purged on
-//! rewrite; `gc()` merges postings below `min_posting_size`.
-//!
-//! ```ignore
-//! use diskann_rs::{DistL2, QuantizerKind, SPFresh, SPFreshConfig};
-//! let idx = SPFresh::<DistL2>::build(&vectors, "spf", SPFreshConfig::default(), Some(QuantizerKind::F16))?;
-//! idx.insert(&more)?;
-//! idx.delete(&[3]);
-//! let hits = idx.search(&query, 10, 8);
-//! idx.save()?;
-//! ```
-
 use crate::quantized::{quantized_distance_from_codes, Prepared, QuantizerState};
 use crate::sq::VectorQuantizer;
 use crate::{
@@ -460,6 +437,9 @@ where
                     self.drain(&mut queue)?;
                 }
             }
+            if self.graph.should_compact() {
+                self.compact()?;
+            }
         }
         Ok(ids)
     }
@@ -610,7 +590,11 @@ where
                 self.rewrite(b, &entries);
             }
         }
-        self.drain(&mut queue)
+        self.drain(&mut queue)?;
+        if self.graph.should_compact() {
+            self.compact()?;
+        }
+        Ok(())
     }
 
     fn compact(&mut self) -> Result<(), DiskAnnError> {
@@ -860,7 +844,7 @@ where
 #[cfg(feature = "object-store")]
 mod remote {
     use super::*;
-    use object_store::{path::Path, ObjectStore, PutMode, PutOptions, PutPayload};
+    use object_store::{path::Path, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
     use std::io::{Seek, SeekFrom, Write};
 
     fn oe(e: object_store::Error) -> DiskAnnError {

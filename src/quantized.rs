@@ -1,32 +1,3 @@
-//! # Integrated Quantized Search for DiskANN
-//!
-//! Fuses quantization into graph traversal so beam search uses compressed
-//! in-memory codes for distance computation instead of reading full f32
-//! vectors from disk. Optionally re-ranks top candidates with exact vectors.
-//!
-//! ## Architecture
-//!
-//! `QuantizedDiskANN<D>` wraps an existing `DiskANN<D>`, storing compressed
-//! codes in a flat `Vec<u8>` buffer for cache-friendly access. An enum
-//! `QuantizerState` dispatches between PQ, F16, and Int8 without dynamic
-//! dispatch overhead on the hot path.
-//!
-//! ## Example
-//!
-//! ```ignore
-//! use crate::DistL2;
-//! use diskann_rs::{QuantizedDiskANN, QuantizedConfig};
-//! use diskann_rs::pq::PQConfig;
-//!
-//! let vectors = vec![vec![0.0f32; 64]; 1000];
-//! let config = QuantizedConfig { rerank_size: 50 };
-//! let index = QuantizedDiskANN::<DistL2>::build_pq(
-//!     &vectors, DistL2{}, "index.db", Default::default(), PQConfig::default(), config,
-//! ).unwrap();
-//!
-//! let results = index.search(&vec![0.0; 64], 10, 64);
-//! ```
-
 use crate::pq::{PQConfig, ProductQuantizer};
 use crate::rabitq::{RaBitQ, RaBitQQuery};
 use crate::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};

@@ -1,30 +1,3 @@
-//! # Scalar Quantization (F16 and Int8)
-//!
-//! Standalone composable quantizers following the same pattern as [`ProductQuantizer`](crate::pq::ProductQuantizer).
-//!
-//! ## F16Quantizer
-//!
-//! Lossless-ish compression: f32 -> f16 (2 bytes per dimension).
-//! Uses hardware F16C / NEON conversion when available.
-//!
-//! ## Int8Quantizer
-//!
-//! Affine per-dimension quantization: f32 -> u8 (1 byte per dimension).
-//! Trained on sample data to learn per-dimension min/max scales.
-//!
-//! ## VectorQuantizer trait
-//!
-//! Shared interface for PQ, F16, and Int8 quantizers:
-//!
-//! ```ignore
-//! use diskann_rs::sq::{VectorQuantizer, F16Quantizer, Int8Quantizer};
-//!
-//! let f16q = F16Quantizer::new(128);
-//! let codes = f16q.encode(&my_vector);
-//! let decoded = f16q.decode(&codes);
-//! let dist = f16q.asymmetric_distance(&query, &codes);
-//! ```
-
 use crate::DiskAnnError;
 use numkong::{cast, f16, EachScale, Euclidean};
 use serde::{Deserialize, Serialize};

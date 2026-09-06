@@ -1,13 +1,3 @@
-//! 1-bit RaBitQ (Gao & Long, SIGMOD'24).
-//!
-//! Vectors are centered, normalized, rotated by a randomized Hadamard transform
-//! (3 rounds of sign flip + FHT, O(D log D), no matrix stored), and stored as
-//! sign bits. Queries are rotated once and quantized to 4 bits; the estimator
-//! `<ō,q'>/<ō,o'>` is evaluated with AND + popcount over 4 bit-planes.
-//!
-//! Code = `padded/8 + 8` bytes: sign bits, `‖o-c‖²`, `‖o-c‖ / <ō,o'>`.
-//! Estimates are squared L2 distances.
-
 use crate::sq::VectorQuantizer;
 use crate::DiskAnnError;
 use rand::prelude::*;

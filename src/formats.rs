@@ -1,21 +1,3 @@
-//! # Standard ANN Benchmark Format Support
-//!
-//! Readers and writers for the fvecs/ivecs/bvecs formats used by standard ANN
-//! benchmark datasets (SIFT, GIST, GloVe, etc.).
-//!
-//! ## Format Specification
-//!
-//! Each file stores a sequence of vectors. Each vector is preceded by a 4-byte
-//! little-endian integer giving its dimension:
-//!
-//! ```text
-//! [dim:u32][val0][val1]...[val_{dim-1}]  (repeated for each vector)
-//! ```
-//!
-//! - **fvecs**: values are `f32` (4 bytes each)
-//! - **ivecs**: values are `i32` (4 bytes each)
-//! - **bvecs**: values are `u8` (1 byte each)
-
 use crate::DiskAnnError;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};

@@ -1,58 +1,3 @@
-//! # Incremental DiskANN Index
-//!
-//! This module provides `IncrementalDiskANN`, a wrapper around `DiskANN` that supports:
-//! - **Adding vectors** without rebuilding the entire index
-//! - **Deleting vectors** via tombstones (lazy deletion)
-//! - **Compaction** to merge deltas and remove tombstones
-//! - **Filtered search** with per-vector labels
-//! - **Quantized search** with F16, Int8, or PQ quantization
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────┐
-//! │                  IncrementalDiskANN                     │
-//! ├─────────────────────────────────────────────────────────┤
-//! │  ┌─────────────────┐  ┌─────────────────────────────┐   │
-//! │  │   Base Index    │  │        Delta Layer          │   │
-//! │  │   (DiskANN)     │  │   (in-memory vectors +      │   │
-//! │  │   - immutable   │  │    small Vamana graph)      │   │
-//! │  │   - mmap'd      │  │   - mutable                 │   │
-//! │  └─────────────────┘  └─────────────────────────────┘   │
-//! │                                                         │
-//! │  ┌─────────────────────────────────────────────────┐    │
-//! │  │              Tombstone Set                      │    │
-//! │  │   (deleted IDs from base, excluded at search)   │    │
-//! │  └─────────────────────────────────────────────────┘    │
-//! └─────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Usage
-//!
-//! ```no_run
-//! use crate::DistL2;
-//! use diskann_rs::{IncrementalDiskANN, DiskAnnParams};
-//!
-//! // Build initial index
-//! let vectors = vec![vec![0.0; 128]; 1000];
-//! let mut index = IncrementalDiskANN::<DistL2>::build_default(&vectors, "index.db").unwrap();
-//!
-//! // Add new vectors incrementally
-//! let new_vectors = vec![vec![1.0; 128]; 100];
-//! let new_ids = index.add_vectors(&new_vectors).unwrap();
-//!
-//! // Delete vectors (lazy - marks as tombstone)
-//! index.delete_vectors(&[0, 5, 10]).unwrap();
-//!
-//! // Search (automatically excludes tombstones, includes delta)
-//! let results = index.search(&vec![0.5; 128], 10, 64);
-//!
-//! // Compact when delta gets large (rebuilds everything)
-//! if index.should_compact() {
-//!     index.compact("index_v2.db").unwrap();
-//! }
-//! ```
-
 use crate::filtered::Filter;
 use crate::pq::{PQConfig, ProductQuantizer};
 use crate::quantized::{quantized_distance_from_codes, QuantizerState};
@@ -350,7 +295,7 @@ impl DeltaLayer {
 
         let alpha = 1.2f32;
         let mut sorted = candidates.to_vec();
-        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         let mut pruned = Vec::new();
 
@@ -358,22 +303,26 @@ impl DeltaLayer {
             if cand_id as usize == node_idx {
                 continue;
             }
-
-            let mut ok = true;
-            for &sel in &pruned {
-                let d = dist.eval(&self.vectors[cand_id as usize], &self.vectors[sel as usize]);
-                if d < alpha * cand_dist {
-                    ok = false;
-                    break;
-                }
-            }
-
-            if ok {
+            let occluded = pruned.iter().any(|&sel| {
+                alpha * dist.eval(&self.vectors[cand_id as usize], &self.vectors[sel as usize])
+                    < cand_dist
+            });
+            if !occluded {
                 pruned.push(cand_id);
                 if pruned.len() >= self.max_degree {
                     break;
                 }
             }
+        }
+
+        for &(cand_id, _) in &sorted {
+            if pruned.len() >= self.max_degree {
+                break;
+            }
+            if cand_id as usize == node_idx || pruned.contains(&cand_id) {
+                continue;
+            }
+            pruned.push(cand_id);
         }
 
         pruned
@@ -562,6 +511,18 @@ impl<'a, D: Distance<f32> + Copy + Send + Sync + 'static> GraphIndex for Unified
 // =========================================================================
 // Quantizer kind enum for builder API
 // =========================================================================
+
+fn tombstone_config(beam_width: usize, k: usize, tombstones: usize) -> BeamSearchConfig {
+    if tombstones == 0 {
+        return BeamSearchConfig::default();
+    }
+    let expanded = (beam_width * 2).max(k + tombstones.min(beam_width));
+    BeamSearchConfig {
+        expanded_beam: Some(expanded),
+        max_iterations: Some(expanded * 2),
+        early_term_factor: Some(1.5),
+    }
+}
 
 /// Specifies which quantizer to use for incremental quantized builds.
 pub enum QuantizerKind {
@@ -1006,27 +967,15 @@ where
             return Vec::new();
         }
 
-        // If quantizer is configured, use quantized search on base codes
-        // (delta vectors use exact distance since they're small and in-memory)
         if let (Some(ref quantizer), Some(ref base_codes)) = (&self.quantizer, &self.base_codes) {
             let base_count = view.base_count;
             let code_size = self.code_size;
             let rerank_size = self.rerank_size;
-
             let prep = quantizer.prepare(query);
-
             let search_k = if rerank_size > 0 {
                 rerank_size.max(k)
             } else {
                 k
-            };
-
-            // Use expanded beam for tombstone filtering
-            let tombstone_count = tombstones.len();
-            let expanded = if tombstone_count > 0 {
-                Some((beam_width * 2).max(search_k + tombstone_count))
-            } else {
-                None
             };
 
             let mut results = beam_search(
@@ -1036,34 +985,24 @@ where
                 |id| {
                     let id_usize = id as usize;
                     if id_usize < base_count {
-                        // Use quantized distance for base vectors
                         quantized_distance_from_codes(
                             &self.dist, query, id_usize, base_codes, code_size, quantizer, &prep,
                         )
                     } else {
-                        // Use exact distance for delta vectors
                         view.distance_to(query, id)
                     }
                 },
                 |id| view.get_neighbors(id),
                 |id| view.is_live(id),
-                BeamSearchConfig {
-                    expanded_beam: expanded,
-                    max_iterations: expanded.map(|e| e * 2),
-                    early_term_factor: if tombstone_count > 0 { Some(1.5) } else { None },
-                },
+                tombstone_config(beam_width, search_k, tombstones.len()),
             );
 
-            // Re-ranking with exact distances
             if rerank_size > 0 {
                 results = results
                     .iter()
-                    .map(|&(id, _)| {
-                        let exact_dist = view.distance_to(query, id);
-                        (id, exact_dist)
-                    })
+                    .map(|&(id, _)| (id, view.distance_to(query, id)))
                     .collect();
-                results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                results.sort_by(|a, b| a.1.total_cmp(&b.1));
                 results.truncate(k);
             }
 
@@ -1073,17 +1012,6 @@ where
                 .collect();
         }
 
-        // Non-quantized path: exact distances throughout
-        // Use expanded beam to handle tombstones properly — the filter_fn
-        // is only used in filtered mode (expanded_beam set), so we use it
-        // to exclude tombstoned vectors from results.
-        let tombstone_count = tombstones.len();
-        let expanded = if tombstone_count > 0 {
-            Some((beam_width * 2).max(k + tombstone_count))
-        } else {
-            None
-        };
-
         let results = beam_search(
             &start_ids,
             beam_width,
@@ -1091,11 +1019,7 @@ where
             |id| view.distance_to(query, id),
             |id| view.get_neighbors(id),
             |id| view.is_live(id),
-            BeamSearchConfig {
-                expanded_beam: expanded,
-                max_iterations: expanded.map(|e| e * 2),
-                early_term_factor: if tombstone_count > 0 { Some(1.5) } else { None },
-            },
+            tombstone_config(beam_width, k, tombstones.len()),
         );
 
         results
@@ -1126,7 +1050,6 @@ where
         beam_width: usize,
         filter: &Filter,
     ) -> Vec<(u64, f32)> {
-        // Fall back to unfiltered if no labels or Filter::None
         if matches!(filter, Filter::None) || self.base_labels.is_none() {
             return self.search_with_dists(query, k, beam_width);
         }
@@ -1141,16 +1064,17 @@ where
             return Vec::new();
         }
 
-        // Build combined labels view: base_labels ++ delta_labels
         let base_labels = self.base_labels.as_ref().unwrap();
-        let combined_labels: Vec<Vec<u64>> = base_labels
-            .iter()
-            .chain(delta_labels.iter())
-            .cloned()
-            .collect();
+        let base_count = view.base_count;
+        let label_of = |i: usize| -> Option<&[u64]> {
+            if i < base_count {
+                base_labels.get(i)
+            } else {
+                delta_labels.get(i - base_count)
+            }
+            .map(Vec::as_slice)
+        };
 
-        // Compose tombstone check into label filter so dead vectors don't consume
-        // result slots — this way beam search finds the correct k live matches.
         let expanded_beam = (beam_width * 4).max(k * 10);
 
         let results = beam_search(
@@ -1159,17 +1083,7 @@ where
             k,
             |id| view.distance_to(query, id),
             |id| view.get_neighbors(id),
-            |id| {
-                if !view.is_live(id) {
-                    return false;
-                }
-                let idx = id as usize;
-                if idx < combined_labels.len() {
-                    filter.matches(&combined_labels[idx])
-                } else {
-                    false
-                }
-            },
+            |id| view.is_live(id) && label_of(id as usize).map_or(false, |l| filter.matches(l)),
             BeamSearchConfig {
                 expanded_beam: Some(expanded_beam),
                 max_iterations: Some(expanded_beam * 2),

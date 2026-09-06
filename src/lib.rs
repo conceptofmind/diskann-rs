@@ -1,64 +1,3 @@
-//! # DiskAnn (generic over `anndists::Distance<f32>`)
-//!
-//! A minimal, on-disk, DiskANN-like library that:
-//! - Builds a Vamana-style graph (greedy + α-pruning) in memory
-//! - Writes vectors + fixed-degree adjacency to a single file
-//! - Memory-maps the file for low-overhead reads
-//! - Is **generic over any `Distance<f32>`** from `anndists` (L2, Cosine, Hamming, Dot, …)
-//! - Supports **incremental updates** (add/delete vectors without full rebuild)
-//!
-//! ## Example
-//! ```no_run
-//! use crate::{DistL2, DistCosine};
-//! use diskann_rs::{DiskANN, DiskAnnParams};
-//!
-//! // Build a new index from vectors, using L2 and default params
-//! let vectors = vec![vec![0.0; 128]; 1000];
-//! let index = DiskANN::<DistL2>::build_index_default(&vectors, DistL2{}, "index.db").unwrap();
-//!
-//! // Or with custom params
-//! let index2 = DiskANN::<DistCosine>::build_index_with_params(
-//!     &vectors,
-//!     DistCosine{},
-//!     "index_cos.db",
-//!     DiskAnnParams { max_degree: 48, ..Default::default() },
-//! ).unwrap();
-//!
-//! // Search the index
-//! let query = vec![0.0; 128];
-//! let neighbors = index.search(&query, 10, 64);
-//!
-//! // Open later (provide the same distance type)
-//! let _reopened = DiskANN::<DistL2>::open_index_default_metric("index.db").unwrap();
-//! ```
-//!
-//! ## Incremental Updates
-//! ```no_run
-//! use anndists::dist::DistL2;
-//! use diskann_rs::IncrementalDiskANN;
-//!
-//! // Build initial index
-//! let vectors = vec![vec![0.0; 128]; 1000];
-//! let mut index = IncrementalDiskANN::<DistL2>::build_default(&vectors, "index.db").unwrap();
-//!
-//! // Add vectors without rebuilding
-//! let new_ids = index.add_vectors(&[vec![1.0; 128]]).unwrap();
-//!
-//! // Delete vectors (lazy tombstoning)
-//! index.delete_vectors(&[0, 1, 2]).unwrap();
-//!
-//! // Compact when needed
-//! if index.should_compact() {
-//!     index.compact("index_v2.db").unwrap();
-//! }
-//! ```
-//!
-//! ## File Layout
-//! [ metadata_len:u64 ][ metadata (bincode) ][ padding up to vectors_offset ]
-//! [ vectors (num * dim * f32) ][ adjacency (num * max_degree * u32) ]
-//!
-//! `vectors_offset` is a fixed 1 MiB gap by default.
-
 mod filtered;
 pub mod formats;
 mod incremental;
@@ -270,16 +209,9 @@ pub(crate) fn beam_search(
 
     let mut visited = HashSet::new();
     let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
-    let mut w: BinaryHeap<Candidate> = BinaryHeap::new(); // working set (max-heap by dist)
+    let mut w: BinaryHeap<Candidate> = BinaryHeap::new();
+    let mut results: Vec<(u32, f32)> = Vec::with_capacity(if is_filtered { k } else { 0 });
 
-    // For filtered search, maintain a separate sorted results vec
-    let mut results: Vec<(u32, f32)> = if is_filtered {
-        Vec::with_capacity(k)
-    } else {
-        Vec::new() // unused in non-filtered mode
-    };
-
-    // Seed from all start nodes
     for &sid in start_ids {
         if !visited.insert(sid) {
             continue;
@@ -292,6 +224,10 @@ pub(crate) fn beam_search(
             results.push((sid, d));
         }
     }
+    if is_filtered {
+        results.sort_by(|a, b| a.1.total_cmp(&b.1));
+        results.truncate(k);
+    }
 
     let mut iterations = 0;
     let max_iterations = config.max_iterations.unwrap_or(usize::MAX);
@@ -303,7 +239,6 @@ pub(crate) fn beam_search(
             break;
         }
 
-        // Filtered early termination: stop when best frontier can't improve worst result
         if is_filtered && results.len() >= k {
             if let Some((_, worst_dist)) = results.last() {
                 if early_term_factor.is_finite()
@@ -315,7 +250,6 @@ pub(crate) fn beam_search(
             }
         }
 
-        // Standard beam termination
         if w.len() >= working_beam {
             if let Some(worst) = w.peek() {
                 if best.dist >= worst.dist {
@@ -334,7 +268,6 @@ pub(crate) fn beam_search(
             let d = distance_fn(nb);
             let cand = Candidate { dist: d, id: nb };
 
-            // Always add to working set for graph exploration
             if w.len() < working_beam {
                 w.push(cand);
                 frontier.push(Reverse(cand));
@@ -344,7 +277,6 @@ pub(crate) fn beam_search(
                 frontier.push(Reverse(cand));
             }
 
-            // For filtered search, maintain separate results
             if is_filtered && filter_fn(nb) {
                 let pos = results
                     .iter()
@@ -363,9 +295,8 @@ pub(crate) fn beam_search(
     if is_filtered {
         results
     } else {
-        // Non-filtered: extract top-k from working set
         let mut candidates: Vec<_> = w.into_vec();
-        candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+        candidates.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         candidates.truncate(k);
         candidates.into_iter().map(|c| (c.id, c.dist)).collect()
     }
