@@ -516,7 +516,10 @@ where
         let want = if rerank { k.max(self.cfg.rerank_size) } else { k };
         let mut heap = BinaryHeap::new();
         for (b, d) in probes {
-            if d > d0 * self.cfg.probe_ratio {
+            if self.cfg.probe_ratio.is_finite()
+                && d0 >= 0.0
+                && d > d0 * self.cfg.probe_ratio.max(1.0)
+            {
                 break;
             }
             for i in 0..self.len(b) {

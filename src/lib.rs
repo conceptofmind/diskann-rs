@@ -296,7 +296,7 @@ pub(crate) fn beam_search(
 
     let mut iterations = 0;
     let max_iterations = config.max_iterations.unwrap_or(usize::MAX);
-    let early_term_factor = config.early_term_factor.unwrap_or(f32::MAX);
+    let early_term_factor = config.early_term_factor.unwrap_or(f32::INFINITY);
 
     while let Some(Reverse(best)) = frontier.peek().copied() {
         iterations += 1;
@@ -307,7 +307,10 @@ pub(crate) fn beam_search(
         // Filtered early termination: stop when best frontier can't improve worst result
         if is_filtered && results.len() >= k {
             if let Some((_, worst_dist)) = results.last() {
-                if best.dist > *worst_dist * early_term_factor {
+                if early_term_factor.is_finite()
+                    && *worst_dist >= 0.0
+                    && best.dist > *worst_dist * early_term_factor.max(1.0)
+                {
                     break;
                 }
             }
