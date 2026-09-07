@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "pydiskann"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "diskann-rs",
  "object_store",

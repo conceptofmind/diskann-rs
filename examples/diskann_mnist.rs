@@ -2,9 +2,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use cpu_time::ProcessTime;
-use diskann_rs::{DiskANN, DiskAnnError, DiskAnnParams, DistL2};
+use diskann_rs::{DiskAnnError, DistL2, SPFresh, SPFreshConfig};
 use rayon::prelude::*;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 mod utils;
 use utils::*;
@@ -22,7 +21,7 @@ fn main() -> Result<(), DiskAnnError> {
     // Load ANN benchmark data (Fashion-MNIST, L2, HDF5), must be in crate root
     // wget http://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5
     let fname = String::from("./fashion-mnist-784-euclidean.hdf5");
-    println!("\n\nDiskANN benchmark on {:?}", fname);
+    println!("\n\nSPFresh benchmark on {:?}", fname);
 
     let anndata = annhdf5::AnnBenchmarkData::new(fname.clone())
         .expect("Failed to load fashion-mnist-784-euclidean.hdf5");
@@ -34,14 +33,12 @@ fn main() -> Result<(), DiskAnnError> {
     println!("Test size  : {}", nb_search);
     println!("Ground-truth k per query in file: {}", knbn_max);
 
-    // DiskANN build parameters (tune as desired)
-    let max_degree = 48;
-    let build_beam_width = 128; // smaller beam for faster build (64–128)
-    let alpha = 1.2; // standard α
+    // SPFresh build parameters (tune as desired)
+    let max_posting_size = 128; // split postings at this size
     let search_k = 10; // evaluate @k=10 (matches HNSW example)
-    let search_beam = 384; // search beam: speed/recall tradeoff
+    let n_probe = 32; // postings scanned per query: speed/recall tradeoff
 
-    // Build vectors for DiskANN (we only need the float rows; ids are implicit 0..n-1)
+    // Build vectors for SPFresh (we only need the float rows; ids are implicit 0..n-1)
     // anndata.train_data is Vec<(Vec<f32>, usize_id)>; we only take the Vec<f32> in order.
     let train_vectors: Vec<Vec<f32>> = anndata
         .train_data
@@ -50,32 +47,24 @@ fn main() -> Result<(), DiskAnnError> {
         .collect();
 
     // Build (if needed) or open index
-    let index_path = "diskann_mnist.db";
-    let index = if !std::path::Path::new(index_path).exists() {
+    let index_path = "spfresh_mnist";
+    let index = if !std::path::Path::new(&format!("{index_path}.spf")).exists() {
         println!(
-            "\nBuilding DiskANN index: n={}, dim={}, max_degree={}, build_beam={}, alpha={}",
+            "\nBuilding SPFresh index: n={}, dim={}, max_posting_size={}",
             train_vectors.len(),
             train_vectors[0].len(),
-            max_degree,
-            build_beam_width,
-            alpha
+            max_posting_size
         );
 
-        let params = DiskAnnParams {
-            max_degree,
-            build_beam_width,
-            alpha,
+        let cfg = SPFreshConfig {
+            max_posting_size,
+            ..Default::default()
         };
 
         let start_cpu = ProcessTime::now();
         let start_wall = SystemTime::now();
 
-        let idx = DiskANN::<DistL2>::build_index_with_params(
-            &train_vectors,
-            DistL2 {},
-            index_path,
-            params,
-        )?;
+        let idx = SPFresh::<DistL2>::build(&train_vectors, index_path, cfg, None)?;
 
         let cpu_time: Duration = start_cpu.elapsed();
         let wall_time = start_wall.elapsed().unwrap();
@@ -86,40 +75,40 @@ fn main() -> Result<(), DiskAnnError> {
 
         idx
     } else {
-        println!("\nIndex file {} exists, opening…", index_path);
+        println!("\nIndex {} exists, opening…", index_path);
         let start_wall = SystemTime::now();
-        let idx = DiskANN::<DistL2>::open_index_with(index_path, DistL2 {})?;
+        let idx = SPFresh::<DistL2>::open(index_path)?;
         let wall_time = start_wall.elapsed().unwrap();
         println!(
-            "Opened index: {} vectors, dim={}, metric={} in {:?}",
-            idx.num_vectors, idx.dim, idx.distance_name, wall_time
+            "Opened index: {} vectors, dim={} in {:?}",
+            idx.stats().live,
+            idx.dim(),
+            wall_time
         );
         idx
     };
 
-    let index = Arc::new(index);
-
     // Search (parallel), compute recall
     println!(
-        "\nSearching {} queries with k={}, beam_width={} …",
-        nb_search, search_k, search_beam
+        "\nSearching {} queries with k={}, n_probe={} …",
+        nb_search, search_k, n_probe
     );
 
     // Parallel search timing
     let start_cpu = ProcessTime::now();
     let start_wall = SystemTime::now();
 
-    // For each test vector, run DiskANN search, then compute distances of returned neighbors
+    // For each test vector, run SPFresh search, then compute distances of returned neighbors
     // to compare vs. ground truth threshold (k-th smallest true distance).
     let results_dists: Vec<Vec<f32>> = anndata
         .test_data
         .par_iter()
         .map(|q| {
-            let ids = index.search(q, search_k, search_beam);
+            let ids = index.search(q, search_k, n_probe);
             // compute distances for the returned neighbors
             let mut ds = Vec::with_capacity(ids.len());
             for &id in &ids {
-                let v = index.get_vector(id as usize);
+                let v = index.get_vector(id).expect("missing vector");
                 ds.push(euclid(q, &v));
             }
             ds.sort_by(|a, b| a.partial_cmp(b).unwrap());

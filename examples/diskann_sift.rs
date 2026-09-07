@@ -2,9 +2,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use cpu_time::ProcessTime;
-use diskann_rs::{DiskANN, DiskAnnError, DiskAnnParams, DistL2};
+use diskann_rs::{DiskAnnError, DistL2, SPFresh, SPFreshConfig};
 use rayon::prelude::*;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 mod utils;
@@ -20,30 +19,30 @@ fn euclid(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn run_search(
-    index: &Arc<DiskANN<DistL2>>,
+    index: &SPFresh<DistL2>,
     anndata: &annhdf5::AnnBenchmarkData,
     k: usize,
-    beam_width: usize,
+    n_probe: usize,
 ) {
     let nb_search = anndata.test_data.len();
 
     println!(
-        "\nSearching {} queries with k={}, beam_width={} …",
-        nb_search, k, beam_width
+        "\nSearching {} queries with k={}, n_probe={} …",
+        nb_search, k, n_probe
     );
 
     let start_cpu = ProcessTime::now();
     let start_wall = SystemTime::now();
 
-    // Run DiskANN in parallel; collect distances of returned neighbors
+    // Run SPFresh in parallel; collect distances of returned neighbors
     let results_dists: Vec<Vec<f32>> = anndata
         .test_data
         .par_iter()
         .map(|q| {
-            let ids = index.search(q, k, beam_width);
+            let ids = index.search(q, k, n_probe);
             let mut ds = Vec::with_capacity(ids.len());
             for &id in &ids {
-                let v = index.get_vector(id as usize);
+                let v = index.get_vector(id).expect("missing vector");
                 ds.push(euclid(q, &v));
             }
             ds.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -106,7 +105,7 @@ fn main() -> Result<(), DiskAnnError> {
     // SIFT1M (L2) HDF5 path
     // wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
     let fname = String::from("./sift-128-euclidean.hdf5");
-    println!("\n\nDiskANN benchmark on {:?}", fname);
+    println!("\n\nSPFresh benchmark on {:?}", fname);
 
     // Make this mutable so we can clear fields to free memory.
     let mut anndata =
@@ -121,19 +120,15 @@ fn main() -> Result<(), DiskAnnError> {
     println!("Ground-truth k per query in file: {}", knbn_max);
 
     // Build/open parameters
-    let max_degree = 64;
-    let build_beam_width = 128;
-    let alpha = 1.2;
+    let max_posting_size = 128;
 
-    let index_path = "diskann_sift1m.db";
-    let index = if !std::path::Path::new(index_path).exists() {
+    let index_path = "spfresh_sift1m";
+    let index = if !std::path::Path::new(&format!("{index_path}.spf")).exists() {
         println!(
-            "\nBuilding DiskANN index: n={}, dim={}, max_degree={}, build_beam={}, alpha={}",
+            "\nBuilding SPFresh index: n={}, dim={}, max_posting_size={}",
             nb_elem,
             anndata.train_data[0].0.len(),
-            max_degree,
-            build_beam_width,
-            alpha
+            max_posting_size
         );
 
         // Clone the training matrix ONLY when we actually need to build.
@@ -143,21 +138,15 @@ fn main() -> Result<(), DiskAnnError> {
             .map(|pair| pair.0.clone())
             .collect();
 
-        let params = DiskAnnParams {
-            max_degree,
-            build_beam_width,
-            alpha,
+        let cfg = SPFreshConfig {
+            max_posting_size,
+            ..Default::default()
         };
 
         let start_cpu = ProcessTime::now();
         let start_wall = SystemTime::now();
 
-        let idx = DiskANN::<DistL2>::build_index_with_params(
-            &train_vectors,
-            DistL2 {},
-            index_path,
-            params,
-        )?;
+        let idx = SPFresh::<DistL2>::build(&train_vectors, index_path, cfg, None)?;
 
         let cpu_time: Duration = start_cpu.elapsed();
         let wall_time = start_wall.elapsed().unwrap();
@@ -175,13 +164,15 @@ fn main() -> Result<(), DiskAnnError> {
 
         idx
     } else {
-        println!("\nIndex file {} exists, opening…", index_path);
+        println!("\nIndex {} exists, opening…", index_path);
         let start_wall = SystemTime::now();
-        let idx = DiskANN::<DistL2>::open_index_with(index_path, DistL2 {})?;
+        let idx = SPFresh::<DistL2>::open(index_path)?;
         let wall_time = start_wall.elapsed().unwrap();
         println!(
-            "Opened index: {} vectors, dim={}, metric={} in {:?}",
-            idx.num_vectors, idx.dim, idx.distance_name, wall_time
+            "Opened index: {} vectors, dim={} in {:?}",
+            idx.stats().live,
+            idx.dim(),
+            wall_time
         );
 
         // FREE HERE #3: when not building, you never need train_data at all
@@ -199,14 +190,12 @@ fn main() -> Result<(), DiskAnnError> {
     // drop(anndata);                                                    // FREE HERE #4: drop the whole loader
     // Then change run_search signature to accept (&test_data, &test_distances, &fname_label).
 
-    let index = Arc::new(index);
-
     // If per-thread scratch is heavy, limit threads (helps RSS):
     // std::env::set_var("RAYON_NUM_THREADS", "8");
 
-    // Evaluate at k=10, beam 256
+    // Evaluate at k=10, 64 probed postings
     let k = 10.min(knbn_max);
-    run_search(&index, &anndata, k, 512);
+    run_search(&index, &anndata, k, 64);
 
     Ok(())
 }

@@ -2,25 +2,27 @@
 //!
 //! Run with: cargo run --example quantization_benchmark --release
 //!
-//! Outputs data for compression ratio vs recall chart.
+//! Builds one SPFresh index per quantizer and outputs data for the
+//! compression ratio vs recall chart.
 
-use diskann_rs::pq::{PQConfig, ProductQuantizer};
-use diskann_rs::sq::{F16Quantizer, Int8Quantizer, VectorQuantizer};
+use diskann_rs::{DistL2, PQConfig, QuantizerKind, SPFresh, SPFreshConfig};
 use rand::prelude::*;
 use rand::SeedableRng;
+use std::collections::HashSet;
 use std::time::Instant;
 
 fn main() {
-    let dim = 128;
+    let dim: usize = 128;
     let n_vectors = 10_000;
     let n_queries = 100;
     let k = 10;
+    let n_probe = 8;
 
-    println!("Quantization Benchmark");
-    println!("======================");
+    println!("Quantization Benchmark (SPFresh)");
+    println!("================================");
     println!(
-        "Vectors: {}, Dim: {}, Queries: {}, k: {}\n",
-        n_vectors, dim, n_queries, k
+        "Vectors: {}, Dim: {}, Queries: {}, k: {}, n_probe: {}\n",
+        n_vectors, dim, n_queries, k, n_probe
     );
 
     // Generate random vectors
@@ -33,145 +35,87 @@ fn main() {
         .collect();
 
     // Compute ground truth (exact k-NN)
-    let ground_truth: Vec<Vec<usize>> = queries
+    let ground_truth: Vec<Vec<u64>> = queries
         .iter()
         .map(|q| {
-            let mut dists: Vec<(usize, f32)> = vectors
+            let mut dists: Vec<(u64, f32)> = vectors
                 .iter()
                 .enumerate()
-                .map(|(i, v)| (i, l2_squared(q, v)))
+                .map(|(i, v)| (i as u64, l2_squared(q, v)))
                 .collect();
             dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
             dists.iter().take(k).map(|(i, _)| *i).collect()
         })
         .collect();
 
+    let pq = |num_subspaces| PQConfig {
+        num_subspaces,
+        num_centroids: 256,
+        kmeans_iterations: 15,
+        training_sample_size: 5000,
+    };
+
+    // (method, quantizer, code size in bytes)
+    let variants = [
+        ("None", None, dim * 4),
+        ("F16", Some(QuantizerKind::F16), dim * 2),
+        ("Int8", Some(QuantizerKind::Int8), dim),
+        ("PQ-32", Some(QuantizerKind::PQ(pq(32))), 32),
+        ("PQ-16", Some(QuantizerKind::PQ(pq(16))), 16),
+        ("PQ-8", Some(QuantizerKind::PQ(pq(8))), 8),
+        (
+            "RaBitQ",
+            Some(QuantizerKind::RaBitQ),
+            dim.max(64).next_power_of_two() / 8 + 8,
+        ),
+    ];
+
     println!(
-        "| Method | Compression | Code Size | Encode Time | Search Time | Recall@{} |",
+        "| Method | Compression | Code Size | Build Time | Search Time | Recall@{} |",
         k
     );
-    println!("|--------|-------------|-----------|-------------|-------------|----------|");
+    println!("|--------|-------------|-----------|------------|-------------|----------|");
 
-    // Baseline (no compression)
-    let baseline_size = dim * 4;
-    println!(
-        "| None (f32) | 1.0x | {} B | - | - | 100.0% |",
-        baseline_size
-    );
-
-    // F16 Quantizer
-    {
-        let q = F16Quantizer::new(dim);
-        let code_size = dim * 2;
-        let compression = baseline_size as f32 / code_size as f32;
-
-        let start = Instant::now();
-        let codes: Vec<Vec<u8>> = vectors.iter().map(|v| q.encode(v)).collect();
-        let encode_time = start.elapsed();
-
-        let start = Instant::now();
-        let recall = compute_recall(&q, &queries, &codes, &ground_truth, k);
-        let search_time = start.elapsed();
-
-        println!(
-            "| F16 | {:.1}x | {} B | {:.1}ms | {:.1}ms | {:.1}% |",
-            compression,
-            code_size,
-            encode_time.as_secs_f64() * 1000.0,
-            search_time.as_secs_f64() * 1000.0,
-            recall * 100.0
-        );
-    }
-
-    // Int8 Quantizer
-    {
-        let q = Int8Quantizer::train(&vectors).unwrap();
-        let code_size = dim;
-        let compression = baseline_size as f32 / code_size as f32;
-
-        let start = Instant::now();
-        let codes: Vec<Vec<u8>> = vectors.iter().map(|v| q.encode(v)).collect();
-        let encode_time = start.elapsed();
-
-        let start = Instant::now();
-        let recall = compute_recall(&q, &queries, &codes, &ground_truth, k);
-        let search_time = start.elapsed();
-
-        println!(
-            "| Int8 | {:.1}x | {} B | {:.1}ms | {:.1}ms | {:.1}% |",
-            compression,
-            code_size,
-            encode_time.as_secs_f64() * 1000.0,
-            search_time.as_secs_f64() * 1000.0,
-            recall * 100.0
-        );
-    }
-
-    // PQ with different subspace counts
-    for num_subspaces in [8, 16, 32] {
-        let config = PQConfig {
-            num_subspaces,
-            num_centroids: 256,
-            kmeans_iterations: 15,
-            training_sample_size: 5000,
+    let mut rows = Vec::new();
+    for (name, quantizer, code_size) in variants {
+        let path = format!("bench_quantized_{}", rows.len());
+        let cfg = SPFreshConfig {
+            max_posting_size: 128,
+            ..Default::default()
         };
-        let q = ProductQuantizer::train(&vectors, config).unwrap();
-        let code_size = num_subspaces;
-        let compression = baseline_size as f32 / code_size as f32;
+        let compression = (dim * 4) as f32 / code_size as f32;
 
         let start = Instant::now();
-        let codes: Vec<Vec<u8>> = vectors.iter().map(|v| q.encode(v)).collect();
-        let encode_time = start.elapsed();
+        let index = SPFresh::<DistL2>::build(&vectors, &path, cfg, quantizer).unwrap();
+        let build_time = start.elapsed();
 
         let start = Instant::now();
-        let recall = compute_recall_pq(&q, &queries, &codes, &ground_truth, k);
+        let recall = compute_recall(&index, &queries, &ground_truth, k, n_probe);
         let search_time = start.elapsed();
 
         println!(
-            "| PQ-{} | {:.1}x | {} B | {:.1}ms | {:.1}ms | {:.1}% |",
-            num_subspaces,
+            "| {} | {:.1}x | {} B | {:.1}ms | {:.1}ms | {:.1}% |",
+            name,
             compression,
             code_size,
-            encode_time.as_secs_f64() * 1000.0,
+            build_time.as_secs_f64() * 1000.0,
             search_time.as_secs_f64() * 1000.0,
             recall * 100.0
         );
+        rows.push((name, compression, recall));
+        cleanup(&path);
     }
 
     println!("\n# Chart Data (CSV)");
     println!("method,compression,recall");
-    println!("None,1.0,100.0");
+    for (name, compression, recall) in rows {
+        println!("{},{:.1},{:.1}", name, compression, recall * 100.0);
+    }
+}
 
-    // Regenerate for CSV output
-    {
-        let q = F16Quantizer::new(dim);
-        let codes: Vec<Vec<u8>> = vectors.iter().map(|v| q.encode(v)).collect();
-        let recall = compute_recall(&q, &queries, &codes, &ground_truth, k);
-        println!("F16,2.0,{:.1}", recall * 100.0);
-    }
-    {
-        let q = Int8Quantizer::train(&vectors).unwrap();
-        let codes: Vec<Vec<u8>> = vectors.iter().map(|v| q.encode(v)).collect();
-        let recall = compute_recall(&q, &queries, &codes, &ground_truth, k);
-        println!("Int8,4.0,{:.1}", recall * 100.0);
-    }
-    for num_subspaces in [32, 16, 8] {
-        let config = PQConfig {
-            num_subspaces,
-            num_centroids: 256,
-            kmeans_iterations: 15,
-            training_sample_size: 5000,
-        };
-        let q = ProductQuantizer::train(&vectors, config).unwrap();
-        let codes: Vec<Vec<u8>> = vectors.iter().map(|v| q.encode(v)).collect();
-        let recall = compute_recall_pq(&q, &queries, &codes, &ground_truth, k);
-        let compression = baseline_size as f32 / num_subspaces as f32;
-        println!(
-            "PQ-{},{:.1},{:.1}",
-            num_subspaces,
-            compression,
-            recall * 100.0
-        );
+fn cleanup(path: &str) {
+    for suffix in ["spf", "postings", "vectors", "centroids", "centroids.base"] {
+        let _ = std::fs::remove_file(format!("{path}.{suffix}"));
     }
 }
 
@@ -180,48 +124,16 @@ fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn compute_recall(
-    q: &dyn VectorQuantizer,
+    index: &SPFresh<DistL2>,
     queries: &[Vec<f32>],
-    codes: &[Vec<u8>],
-    ground_truth: &[Vec<usize>],
+    ground_truth: &[Vec<u64>],
     k: usize,
+    n_probe: usize,
 ) -> f32 {
     let mut total_recall = 0.0;
     for (query, gt) in queries.iter().zip(ground_truth) {
-        let mut dists: Vec<(usize, f32)> = codes
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (i, q.asymmetric_distance(query, c)))
-            .collect();
-        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        let retrieved: std::collections::HashSet<usize> =
-            dists.iter().take(k).map(|(i, _)| *i).collect();
-        let gt_set: std::collections::HashSet<usize> = gt.iter().copied().collect();
-        let hits = retrieved.intersection(&gt_set).count();
-        total_recall += hits as f32 / k as f32;
-    }
-    total_recall / queries.len() as f32
-}
-
-fn compute_recall_pq(
-    q: &ProductQuantizer,
-    queries: &[Vec<f32>],
-    codes: &[Vec<u8>],
-    ground_truth: &[Vec<usize>],
-    k: usize,
-) -> f32 {
-    let mut total_recall = 0.0;
-    for (query, gt) in queries.iter().zip(ground_truth) {
-        let table = q.create_distance_table(query);
-        let mut dists: Vec<(usize, f32)> = codes
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (i, q.distance_with_table(&table, c)))
-            .collect();
-        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        let retrieved: std::collections::HashSet<usize> =
-            dists.iter().take(k).map(|(i, _)| *i).collect();
-        let gt_set: std::collections::HashSet<usize> = gt.iter().copied().collect();
+        let retrieved: HashSet<u64> = index.search(query, k, n_probe).into_iter().collect();
+        let gt_set: HashSet<u64> = gt.iter().copied().collect();
         let hits = retrieved.intersection(&gt_set).count();
         total_recall += hits as f32 / k as f32;
     }

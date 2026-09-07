@@ -27,10 +27,10 @@ sysinfo = "0.32"
 
 [features]
 default = []
-hdf5 = ["dep:hdf5-metno"]
+hdf5 = ["dep:hdf5"]
 object-store = ["dep:object_store"]
 
-[dependencies.hdf5-metno]
+[dependencies.hdf5]
 package = "hdf5-metno"
 version = "0.10.0"
 optional = true

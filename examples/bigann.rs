@@ -3,16 +3,16 @@
 //! BigANN for diskann-rs.
 //! - expects these files in the repository root:
 //!     bigann_base.bvecs, bigann_query.bvecs, dis_100M.fvecs, idx_100M.ivecs
-//! - builds (or reuses) a DiskANN index at "big_diskann_index.db"
+//! - builds (or reuses) an SPFresh index at "big_spfresh_index.*"
 //! - runs recall@10 and recall@100 on the first 100k queries
 //!
 //! Notes:
-//! - This example converts u8 BVECs to f32 and builds an *in-memory* index
-//!   (then mmaps it). Building on the full dataset requires a lot of RAM.
-//!   Adjust NB_DATA_POINTS to a subset if needed.
+//! - This example converts u8 BVECs to f32 in memory before inserting them
+//!   into the mmapped SPFresh index. Building on the full dataset requires
+//!   a lot of RAM. Adjust NB_DATA_POINTS to a subset if needed.
 
 use byteorder::{LittleEndian, ReadBytesExt};
-use diskann_rs::{DiskANN, DiskAnnParams, DistL2};
+use diskann_rs::{DistL2, SPFresh, SPFreshConfig};
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
@@ -28,16 +28,19 @@ const NB_DATA_POINTS: usize = 10_000_000;
 // Number of queries to evaluate.
 const NB_QUERY: usize = 10_000;
 
-// Disk path for the index (auto-reused if it exists).
-const INDEX_PATH: &str = "big_diskann_index.db";
+// Disk path prefix for the index (auto-reused if it exists).
+const INDEX_PATH: &str = "big_spfresh_index";
 
-// DiskANN build/search knobs (feel free to tweak).
-const DISKANN_PARAMS: DiskAnnParams = DiskAnnParams {
-    max_degree: 48,
-    build_beam_width: 200,
-    alpha: 1.2,
+// SPFresh build/search knobs (feel free to tweak).
+const SPFRESH_CONFIG: SPFreshConfig = SPFreshConfig {
+    max_posting_size: 128,
+    min_posting_size: 16,
+    probe_ratio: f32::INFINITY,
+    rerank_size: 0,
+    reassign_neighbors: 16,
+    centroid_beam: 64,
 };
-const BEAM_SEARCH: usize = 512;
+const N_PROBE: usize = 64;
 
 fn read_bvecs_block<const SIZE: usize>(
     r: &mut BufReader<File>,
@@ -166,11 +169,10 @@ fn euclid(a: &[f32], b: &[f32]) -> f32 {
     s.sqrt()
 }
 
-fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> DiskANN<DistL2> {
-    if Path::new(index_path).exists() {
+fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> SPFresh<DistL2> {
+    if Path::new(&format!("{index_path}.spf")).exists() {
         println!("Opening existing index at '{}'", index_path);
-        return DiskANN::<DistL2>::open_index_default_metric(index_path)
-            .expect("open_index_default_metric failed");
+        return SPFresh::<DistL2>::open(index_path).expect("SPFresh::open failed");
     }
 
     println!(
@@ -189,15 +191,14 @@ fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> Di
     let vectors: Vec<Vec<f32>> = base_u8.iter().map(|v| u8s_to_f32(v)).collect();
 
     println!(
-        "Loaded {} vectors in {:.1}s; building DiskANN…",
+        "Loaded {} vectors in {:.1}s; building SPFresh…",
         vectors.len(),
         t0.elapsed().as_secs_f32()
     );
 
     let t1 = Instant::now();
-    let index =
-        DiskANN::<DistL2>::build_index_with_params(&vectors, DistL2 {}, index_path, DISKANN_PARAMS)
-            .expect("build_index_with_params failed");
+    let index = SPFresh::<DistL2>::build(&vectors, index_path, SPFRESH_CONFIG, None)
+        .expect("SPFresh::build failed");
 
     println!(
         "Build + write done in {:.1}s, {}",
@@ -209,11 +210,11 @@ fn build_or_load_index(base_path: &str, index_path: &str, n_points: usize) -> Di
 }
 
 fn eval_recall(
-    index: &DiskANN<DistL2>,
+    index: &SPFresh<DistL2>,
     queries_f32: &[Vec<f32>],
     gt: &[Vec<(u32, f32)>], // (id, sqdist)
     k: usize,
-    beam: usize,
+    n_probe: usize,
 ) {
     let t0 = Instant::now();
 
@@ -222,16 +223,13 @@ fn eval_recall(
         .par_iter()
         .enumerate()
         .map(|(qi, q)| {
-            let nns = index.search(q, k, beam);
+            let nns = index.search(q, k, n_probe);
             let kth = gt[qi][k - 1].1.sqrt();
 
             // Count how many returned are within GT@k radius
             let mut local_correct = 0usize;
             for &id in &nns {
-                // If you later add a zero-copy accessor, prefer:
-                // let v = index.get_vector_slice(id as usize);
-                // let d = euclid(q, v);
-                let v = index.get_vector(id as usize);
+                let v = index.get_vector(id).expect("missing vector");
                 let d = euclid(q, &v);
                 if d <= kth {
                     local_correct += 1;
@@ -246,29 +244,29 @@ fn eval_recall(
     let qps = (queries_f32.len() as f32) / secs;
 
     println!(
-        "k={k:>3}  recall={:.4}  qps={:.1}  time={:.1}s  (beam={})",
-        recall, qps, secs, beam
+        "k={k:>3}  recall={:.4}  qps={:.1}  time={:.1}s  (n_probe={})",
+        recall, qps, secs, n_probe
     );
 }
 
 // Single-threaded
 fn eval_recall_single(
-    index: &DiskANN<DistL2>,
+    index: &SPFresh<DistL2>,
     queries_f32: &[Vec<f32>],
     gt: &[Vec<(u32, f32)>], // (id, sqdist)
     k: usize,
-    beam: usize,
+    n_probe: usize,
 ) {
     assert_eq!(queries_f32.len(), gt.len());
     let t0 = Instant::now();
 
     let mut correct = 0usize;
     for (qi, q) in queries_f32.iter().enumerate() {
-        let nns = index.search(q, k, beam);
+        let nns = index.search(q, k, n_probe);
         let kth = gt[qi][k - 1].1.sqrt();
 
         for &id in &nns {
-            let v = index.get_vector(id as usize);
+            let v = index.get_vector(id).expect("missing vector");
             let d = euclid(q, &v);
             if d <= kth {
                 correct += 1;
@@ -281,8 +279,8 @@ fn eval_recall_single(
     let qps = (queries_f32.len() as f32) / secs;
 
     println!(
-        "k={k:>3}  recall={:.4}  qps={:.1}  time={:.1}s  (beam={})",
-        recall, qps, secs, beam
+        "k={k:>3}  recall={:.4}  qps={:.1}  time={:.1}s  (n_probe={})",
+        recall, qps, secs, n_probe
     );
 }
 
@@ -314,10 +312,10 @@ fn main() {
 
     // Evaluate
     if PARALLEL {
-        eval_recall(&index, &queries_f32, &gt, 10, BEAM_SEARCH);
-        eval_recall(&index, &queries_f32, &gt, 100, BEAM_SEARCH);
+        eval_recall(&index, &queries_f32, &gt, 10, N_PROBE);
+        eval_recall(&index, &queries_f32, &gt, 100, N_PROBE);
     } else {
-        eval_recall_single(&index, &queries_f32, &gt, 10, BEAM_SEARCH);
-        eval_recall_single(&index, &queries_f32, &gt, 100, BEAM_SEARCH);
+        eval_recall_single(&index, &queries_f32, &gt, 10, N_PROBE);
+        eval_recall_single(&index, &queries_f32, &gt, 100, N_PROBE);
     }
 }
