@@ -1,3 +1,7 @@
+# Warning
+
+Use https://github.com/teraflop-ai/pydiskann as this will be maintained going forward.
+
 # DiskANN Implementation in Rust
 
 A fork of https://docs.rs/diskann_rs/latest/diskann_rs/
